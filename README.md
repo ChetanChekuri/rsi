@@ -1,92 +1,118 @@
 # rsi: a proto recursive self-improvement loop
 
-A language model looks at its own reasoning, decides how to change its own weights, the change is tested, and it is
-kept only if the model gets better. The next cycle is then run by the changed model. No gradient training: every
-change is a closed-form edit of the weight matrices (a rank-1 projection or a scaling), found and applied in seconds.
+A language model works on its own weights. It gets a sandbox, its weights, and freedom to run any code it likes on
+them. It can build new versions of itself, register them with ollama, try them out, and submit one as its successor.
+A held-out test the model can't touch decides whether the successor replaces it. The next cycle is then run by
+whichever model won.
 
 ```
 rsi            # in any folder: pick a model, type the main prompt (the goal), then watch it work on itself
 ```
 
-![rsi: the model writing its own practice problems, streamed live](docs/rsi_live.svg)
+![rsi: the model's work streamed live](docs/rsi_live.svg)
 
-Each folder is its own loop: everything it does lives in `<folder>/.rsi/`. The loop runs in the background, so
-closing the window (ctrl+q) doesn't stop it; `rsi stop` does. Run `rsi` in the folder again to reconnect. If the loop
-died (crash, reboot), it resumes at the cycle it was on, reuses every problem it already solved, and carries on
-with the plan it had picked.
+Each folder is its own loop. Its state lives in `<folder>/.rsi/` and the model's files live in `<folder>/workspace/`.
+The loop runs in the background, so closing the window (ctrl+q) doesn't stop it. `rsi stop` stops it. Run `rsi` in
+the folder again to reconnect (or restart it). If the loop died (crash, reboot), it resumes at the cycle it was on.
 
 ## Commands
 
 | | |
 |---|---|
-| `rsi` | in a new folder: choose a model and type the main prompt; in a folder with a loop: reconnect (and resume it if it stopped) |
+| `rsi` | in a new folder: choose a model and type the main prompt; in a folder with a loop: reconnect (and resume it unless it was stopped) |
 | `rsi PATH` | the same for another folder |
-| `rsi stop` / `rsi stop PATH` | stop that folder's loop (it resumes the next time you open it) |
-| type + Enter | optional: a direction for the next cycle, used instead of the model's own pick |
+| `rsi stop` / `rsi stop PATH` | stop that folder's loop; it stays stopped until you open `rsi` there again |
+| type + Enter | talk to the model while it works (it reads your message at its next step); the message also becomes the next cycle's direction |
 | ctrl+q | close the window; the loop keeps running |
 
 ## One cycle
 
-1. **Observe.** The model solves a handful of fresh practice problems for the goal (thinking mode). Detectors count
-   where it goes wrong: unfinished answers, "Wait… let me double-check" after it already had the answer, repetition,
-   arithmetic slips.
-2. **Think.** The model reads its own failing traces and the counts, can search the web and arXiv for techniques, and
-   picks **one** change to itself from a short menu, with a strength, a reason and a prediction:
+1. **Practice.** The loop has the current model solve a few fresh practice problems for the goal (thinking mode) and
+   saves the traces into the workspace. Detectors count where it went wrong: unfinished answers, "Wait… let me
+   double-check" after it already had the answer, repetition, arithmetic slips.
+2. **Work.** The model gets a brief (the goal, its practice results, failing excerpts, earlier cycles, its plan) and
+   then works on its own with tools, up to 40 tool calls or 2 hours by default:
 
-   | change | what it does to the weights |
+   | tool | what it does |
    |---|---|
-   | `stop_second_guessing` | removes (part of) the internal direction that drives "Wait…/Hmm…" lines after the answer is known |
-   | `be_more_decisive` / `be_less_decisive` | scales the final norm: a sharper or softer output distribution |
-   | `reason_like_reference` | strengthens the direction from its own reasoning style toward concise reference reasoning |
+   | `run_python`, `run_shell` | run any code in the workspace sandbox; numpy, torch and `rsi_lib` are available |
+   | `read_file`, `write_file`, `list_files` | files in the workspace (notes, scripts, results, GGUFs) |
+   | `web_search`, `arxiv_search`, `fetch_page` | research (TinyFish, arXiv); pages are treated as untrusted text |
+   | `ollama_create` | register a GGUF it built as a runnable model (`rsi-<loop>:<name>`) |
+   | `ollama_list`, `ollama_delete` | list its models; delete ones it made (never its current self or anything it didn't create) |
+   | `practice` | have any of its models solve n fresh practice problems; the traces are saved for analysis |
+   | `submit` | propose one of its models as its successor (once per cycle) |
+   | `finish` | end the cycle with a summary, 2–4 plans for the next cycle, and its pick |
 
-3. **Test.** The change is baked into a copy of the weights. Both versions solve the same fresh held-out problems: new
-   problems for the goal, plus general problems (GSM8K, ARC-Challenge) as a forgetting check.
-4. **Keep or revert.** The copy becomes the model only if it solves at least 2 more goal problems than it breaks, and
-   loses at most 1 general problem net.
-5. **Plan.** The (possibly new) model looks at every result so far, proposes 2–4 plans for the next cycle, picks
-   one with a reason, and the next cycle starts on it. The main prompt you gave at the start is the only input it
-   needs; if you type a direction, the next cycle follows yours instead of its own pick.
+   `rsi_lib` gives the sandbox code a head start: `read_tensor`, `write_model` (a copy of itself with some tensors
+   replaced), `stream()` (a layer-streaming forward pass for activations and losses), `practice_traces()`,
+   `doubt_direction()`, `ablate`/`amplify`. The model can ignore all of it and write its own methods.
+3. **Test.** `submit` runs the held-out test outside the sandbox. The candidate and the current model solve the same
+   fresh problems for the goal, plus general problems (GSM8K, ARC-Challenge) as a forgetting check. The candidate is
+   kept only if it solves at least 2 more goal problems than it breaks and loses at most 1 general problem net. If it
+   is kept, it becomes the current model at once and finishes the cycle itself.
+4. **Plan.** `finish` records the plans and the pick; the next cycle starts on that plan. If you typed a direction,
+   the next cycle follows yours instead.
 
-The left pane shows, live, whatever the model is producing: its thinking about itself, or a problem it is solving
-(with the answer key). It scrolls as the text streams.
+The left pane shows, live, whatever the model is producing: its thinking, its tool calls and their results, or a
+problem it is solving (with the answer key). It scrolls as the text streams.
+
+## The sandbox
+
+Code runs under bubblewrap, inside a systemd scope:
+
+- The workspace is the only writable place, and the only one that persists.
+- The system, the rsi code, the Python environment and ollama's model files are read-only. The model reads its own
+  weights from there.
+- The home directory is hidden, so API keys and the loop's own state aren't visible.
+- The network is off. Research goes through the web tools, which the loop runs itself.
+- Memory, CPU and time are capped: 4 GB, half the cores and 30 minutes per run on a laptop.
+
+Set `"sandbox_network": true` in `.rsi/config.json` to allow network access from code. GPUs are passed through when
+present.
 
 ## Why the results can be trusted
 
-- Test problems are new every cycle (generated, never reused) and are never shown to the model while it decides.
-- The model chooses from a closed menu; it cannot run arbitrary edits. Strengths are clamped to safe ranges.
-- Practice problems come from small Python generators that **compute** their answers. At the start, the model
-  writes generators for your goal itself; they run in a sandbox (import allowlist, no network, CPU and memory limits)
-  and must pass validity checks. If it can't write good ones, built-in generators are used.
-- Web pages are treated as untrusted data; research can only inform the decision, and the test still decides.
-- If an edit leaves the model unable to run the loop (no valid decision), the loop reverts it automatically.
+- The judge isn't the model. `submit` runs the test in the loop's own process. The model only picks which of its
+  models to submit, and it gets one submission per cycle.
+- Test problems are new every cycle and are never shown to the model. Their seeds are offset by a secret stored in
+  `.rsi/`, which the sandbox can't read, so the model can't regenerate its own test and train on it.
+- Practice and test problems come from small Python generators that **compute** their answers. At the start, the
+  model writes generators for your goal; they run in a separate strict sandbox (import allowlist, no files, no
+  network) and must pass validity checks. If it can't write good ones, built-in generators are used.
+- Web pages are untrusted data: they can inform what the model tries, and the test still decides.
 
 ## What we found so far (Qwen3.5-0.8B, thinking mode)
 
 - Its main failure is not knowing too little but **not stopping**: 361 of 368 "Wait/Hmm" events came *after* the
   correct answer had already appeared, so traces ran out of tokens.
-- Removing that doubt direction (`stop_second_guessing`, 0.5–0.7) plus sharpening (`be_more_decisive` 1.6) took it
+- Removing that doubt direction (rank-1 ablation, 0.5–0.7) plus sharpening the output (final norm × 1.6) took it
   from **30% → 74%** on 90 unseen problems (+42/−2), HumanEval 21% → 31%, tool calls 73% → 80%, with ARC knowledge
-  unchanged (0.61 → 0.61). Accuracy on problems both versions finished was the same: the gain is finishing.
+  unchanged (0.61 → 0.61). On 60 more fresh problems: 35% → 73% (+23/−0). Accuracy on problems both versions
+  finished was the same: the gain is finishing.
 - Amplifying a "reason like Claude's traces" direction improved every likelihood proxy (MMLU +4.5, ARC +3.3) but made
   generated reasoning *worse* at strength 0.5 (78% → 65%) and no better at 0.25 (73% vs 71% on 180 items, p=0.49).
-  Rating good reasoning as likely is not the same as producing it, which is why the test step uses real generation.
+  Rating good reasoning as likely is not the same as producing it, which is why the test uses real generation.
+
+These findings are in the playbook the model reads at the start of every cycle.
 
 ## Models and hardware
 
 On every start the loop detects the hardware (CUDA GPUs through torch, else `nvidia-smi`; otherwise CPU cores and
-RAM), shows it in the top bar, and sizes itself: parallel generations, the device for the layer-streaming forward
-pass, and a memory cap on small-RAM CPU machines. A loop moved to a GPU machine speeds up on its next start.
+RAM), shows it in the top bar, and sizes itself: parallel generations, memory and CPU caps for the loop and the
+sandbox, and the device for the layer-streaming forward pass. A loop moved to a GPU machine speeds up on its next
+start.
 
+The weight tools support the Qwen3.5 / Qwen3.8 family (ollama architecture `qwen35`), e.g. `qwen3.5:0.8b` and
+`qwen3.8:27b`. In-place edits need a Q8_0 (or F16) build; for a Q4 model, `rsi` edits the `-q8_0` tag and derives the
+Q4 copy it runs with `llama-quantize` (bundled with ollama). The 0.8B runs on a laptop CPU; Qwen3.8-27B needs a 24–48
+GB GPU and about 120 GB of disk (each model it builds is another full copy, so it is told to clean up).
 
-The weight editor supports the Qwen3.5 / Qwen3.8 family (ollama architecture `qwen35`), e.g. `qwen3.5:0.8b` and
-`qwen3.8:27b`. Editing needs a Q8_0 (or F16) build; for a Q4 model, `rsi` edits the `-q8_0` tag and derives the Q4
-copy it runs with `llama-quantize` (bundled with ollama). The 0.8B runs on a laptop CPU; Qwen3.8-27B needs a 24–48 GB
-GPU and about 120 GB of disk.
-
-Settings: `RSI_OLLAMA_URL` (inference server), `RSI_OLLAMA_ADMIN_URL` (server allowed to register models),
-`RSI_PYTHON`; or a `.env` file next to `bin/`. Per-loop settings (problem counts, keep rule, research on/off,
-unattended `auto` mode) are in `<folder>/.rsi/config.json`. Web search uses TinyFish when a key is in
-`~/.config/rsi/keys.json` or `TINYFISH_API_KEY`, otherwise arXiv, OpenAlex and Wikipedia.
+Settings: `RSI_OLLAMA_URL` (inference server), `RSI_OLLAMA_ADMIN_URL` (server allowed to register and delete models),
+`RSI_PYTHON`; or a `.env` file next to `bin/`. Per-loop settings are in `<folder>/.rsi/config.json`: problem counts,
+the keep rule (`min_gain`, `max_general_loss`), `max_steps`, `max_cycle_minutes`, `max_run_s`, `sandbox_mem`,
+`sandbox_network`. Web search uses TinyFish when a key is in `~/.config/rsi/keys.json` or `TINYFISH_API_KEY`,
+otherwise arXiv, OpenAlex and Wikipedia.
 
 ## Install
 
@@ -97,18 +123,21 @@ ln -s "$PWD/bin/rsi" ~/.local/bin/rsi
 ollama pull qwen3.5:0.8b
 ```
 
+The sandbox needs `bwrap` (`apt install bubblewrap`).
+
 ## Files
 
 ```
-rsi/loop.py         the loop (observe, think, test, keep) and the per-folder session
-rsi/app.py          the screen
-rsi/playbook.md     what the model reads before deciding (how to think, what each change did before)
-rsi/arch_qwen35.py  layer-streaming forward pass over the GGUF (finds directions; ~1 GB resident even for 27B)
-rsi/edits.py        the closed-form edits      rsi/gguf_io.py  bake edits into GGUF, register with ollama
+rsi/loop.py         the loop (practice, work, test, plan) and the per-folder session
+rsi/tools.py        the model's tools          rsi/sandbox.py   the workspace sandbox (and the strict one for generators)
+rsi/app.py          the screen                 rsi/playbook.md  what the model reads every cycle (tools, method, findings)
+rsi_lib/            helpers importable inside the sandbox
+rsi/arch_qwen35.py  layer-streaming forward pass over the GGUF (~1 GB resident even for 27B)
+rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions with held-out separation scores
 rsi/detectors.py    what counts as a failure pattern in a trace
-rsi/factory.py      practice-problem generators (model-written or built-in)   rsi/sandbox.py  runs them safely
-rsi/research.py     web / arXiv search tools for the model       rsi/llm.py  talking to ollama (streams live)
+rsi/factory.py      problem generators (model-written or built-in)
+rsi/research.py     web / arXiv search        rsi/llm.py  talking to ollama (streams live)
 data/               GSM8K test (MIT), ARC-Challenge test (CC BY-SA 4.0), Qwen3.5 tokenizer (Apache-2.0),
                     50 reference reasoning traces written by Claude
 ```

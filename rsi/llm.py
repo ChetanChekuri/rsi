@@ -98,7 +98,7 @@ def solve(cfg, tag, items, path, who="solving"):
             ok = bool(pred.strip()) and grade_code(pred, it["tests"], it["entry_point"])
         else:
             pred = probes.extract(content); ok = probes.grade(it, pred)
-        return {"id": it["id"], "suite": it["suite"], "gold": it.get("gold", ""), "kind": it["kind"],
+        return {"id": it["id"], "suite": it["suite"], "gold": it.get("gold", ""), "kind": it["kind"], "prompt": it["prompt"],
                 "thinking": m.get("thinking", ""), "content": content, "pred": pred[:2000], "correct": ok,
                 "done_reason": r.get("done_reason"), "tokens": r.get("eval_count", 0)}
     with open(path, "a") as f, ThreadPoolExecutor(cfg["workers"]) as ex:

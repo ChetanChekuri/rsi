@@ -1,35 +1,27 @@
-"""The RSI loop. Every cycle:
+"""The RSI loop. You give one main prompt (the goal). Then, every cycle:
 
-  1 observe  the model solves fresh problems for the goal; detectors count where it goes wrong
-  2 think    the model reads its own failing traces (and may search the web), then picks ONE change to its weights
-  3 test     the change is baked into a copy of the weights; both versions solve the same fresh held-out problems
-  4 keep     the copy becomes the model if it solves more of them without getting worse at general problems
-  5 plan     the (possibly new) model proposes plans for the next cycle, picks one, and the loop moves on
+  1 practice  the current model solves fresh problems for the goal; the loop counts where it goes wrong
+  2 work      the model works on itself with tools: it runs any code in its sandboxed workspace, reads its own
+              weights, searches the web, builds new models (GGUF files), registers them with ollama, tests them on
+              practice problems, deletes the ones it doesn't need, and may submit one as its successor
+  3 test      a submitted model is tested against the current one on fresh held-out problems (goal + general); it
+              becomes the new current model only if it is better without getting worse at general problems
+  4 plan      the model ends the cycle with a summary and plans for the next one, and picks one
 
-You give one main prompt (the goal) at the start; after that it runs on its own. Anything you type is used as the
-direction for the next cycle instead of the model's own pick.
-Everything lives in <folder>/.rsi/. The app starts this process (python -m rsi.loop <folder>); it keeps running
-when the app is closed.
+Anything you type reaches the model during the cycle, and overrides its pick for the next one.
+Everything lives in <folder>/.rsi/ (state) and <folder>/workspace/ (the model's sandbox).
 """
 import json, math, os, shutil, signal, subprocess, sys, time, traceback
 import numpy as np
-from . import llm, detectors, directions, gguf_io, research
+from . import llm, detectors, gguf_io, research
 from .factory import Factory, BUILTIN, design
 from .probes import general_pool
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLAYBOOK = os.path.join(ROOT, "rsi", "playbook.md")
+PLANS = {"type": "object", "properties": {"plans": {"type": "array", "items": {"type": "string"}}, "pick": {"type": "integer"},
+                                          "reason": {"type": "string"}}, "required": ["plans", "pick", "reason"]}
 
-# the menu of changes the model can make to itself: name -> (operator, min strength, max strength)
-EDITS = {"stop_second_guessing": ("ablate", 0.1, 0.9), "be_more_decisive": ("sharpen", 1.05, 1.8),
-         "be_less_decisive": ("sharpen", 0.6, 0.95), "reason_like_reference": ("amplify", 0.05, 0.6)}
-PLANS = {"type": "object", "properties": {
-    "plans": {"type": "array", "items": {"type": "object", "properties": {"plan": {"type": "string"}, "why": {"type": "string"}},
-                                         "required": ["plan", "why"]}},
-    "pick": {"type": "integer"}, "reason": {"type": "string"}}, "required": ["plans", "pick", "reason"]}
-DECISION = {"type": "object", "properties": {
-    "diagnosis": {"type": "string"}, "edit": {"type": "string", "enum": list(EDITS)}, "strength": {"type": "number"},
-    "why": {"type": "string"}, "expect": {"type": "string"}}, "required": ["diagnosis", "edit", "strength", "why", "expect"]}
 
 
 # ------------------------------------------------------------------------------------------------ session (a folder)
@@ -77,7 +69,12 @@ class Session:
         except (OSError, ValueError):
             return None
 
+    def stopped(self):
+        return os.path.exists(self.p("STOPPED"))
+
     def start(self):
+        if os.path.exists(self.p("STOPPED")):
+            os.unlink(self.p("STOPPED"))
         if self.pid():
             return self.pid()
         cmd = [sys.executable, "-u", "-m", "rsi.loop", self.folder]
@@ -95,6 +92,7 @@ class Session:
         return self.pid()
 
     def stop(self, grace=10):
+        open(self.p("STOPPED"), "w").write(time.strftime("%Y-%m-%d %H:%M"))   # keeps open windows from restarting it
         pid = self.pid()
         if pid:
             os.kill(pid, signal.SIGTERM)
@@ -193,7 +191,8 @@ def create(folder, model, goal):
     cfg = {"model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"], "name": f"s{abs(hash(s.folder)) % 10**6}",
            "ollama_url": url, "ollama_admin_url": admin, "research": True, "small": small,
            "n_dev_per_family": 3, "n_test_per_family": 5, "n_general": 8, "min_gain": 2, "max_general_loss": 1,
-           "num_predict": 3072 if small else 16384, "num_ctx": 6144 if small else 24576, "pilot_num_predict": 3072 if small else 12000,
+           "num_predict": 3072 if small else 16384, "num_ctx": 16384 if small else 32768, "pilot_num_predict": 4096 if small else 12000,
+           "max_steps": 40, "max_cycle_minutes": 120, "max_run_s": 1800, "sandbox_mem": "4G" if small else "24G", "sandbox_network": False,
            "pilot_think": True, "created": time.strftime("%Y-%m-%d %H:%M"), **sizing(hardware(), small)}
     s.write("config.json", cfg)
     return s
@@ -233,23 +232,35 @@ class Asker:
         raise ValueError("no valid JSON")
 
 
+
+
 class Loop:
     def __init__(self, folder):
         self.s = Session(folder); self.cfg = self.s.cfg; self.state = self.s.p("state")
         self.hw = hardware(); self.cfg.update(sizing(self.hw, self.cfg.get("small", True)))   # this machine, this start
-        llm.LIVE["dir"] = self.s.p("live")
+        llm.LIVE["dir"] = self.s.p("live"); os.makedirs(self.s.p("live"), exist_ok=True)
+        self.workspace = os.path.join(self.s.folder, "workspace"); os.makedirs(self.workspace, exist_ok=True)
         self.admin = self.cfg["ollama_admin_url"].split("://")[-1]
-        self.master_blob, _ = gguf_io.ollama_show(self.cfg["master_tag"], self.admin)
         self.fac = Factory(self.state)
         self.ref = [json.loads(l) for l in open(os.path.join(ROOT, "data", "reference_traces.jsonl"))]
         self.general = general_pool(exclude={r["id"] for r in self.ref})
         self.lineage = self.s.read("lineage.json") or {"generations": [], "current": None}
-        self._S = None
+        self.transcript = []
 
     # -------- bookkeeping
     def status(self, cycle, step, detail="", **kw):
         self.s.write("status.json", {"cycle": cycle, "step": step, "detail": detail, "since": time.time(), "generation": self.lineage["current"],
+                                     "model": self.tag if self.lineage["generations"] else self.cfg["master_tag"],
                                      "device": self.hw["label"], "pid": os.getpid(), **kw})
+
+    def note(self, kind, text):
+        """the agent transcript the app shows: model messages, tool calls, tool results, your messages"""
+        self.transcript.append({"t": time.strftime("%H:%M:%S"), "kind": kind, "text": str(text)[:4000]})
+        self.transcript = self.transcript[-120:]
+        try:
+            self.s.write("live/transcript.json", {"cycle": self.cycle_k, "entries": self.transcript})
+        except Exception:  # noqa: BLE001
+            pass
 
     @property
     def gen(self):
@@ -259,42 +270,24 @@ class Loop:
     def tag(self):
         return self.gen["tag"]
 
-    def traces(self, tag, name):
-        return os.path.join(self.state, "traces", tag.replace(":", "_").replace("/", "_"), name + ".jsonl")
+    def gguf_of(self, tag):
+        return gguf_io.ollama_show(tag, self.admin)[0]
 
-    def stream(self):
-        if self._S is None:
-            from .arch_qwen35 import Qwen35Stream
-            self._S = Qwen35Stream(self.master_blob, os.path.join(ROOT, "data", "qwen35_tokenizer.json"), device=self.cfg["device"], base_dir=self.state)
-        return self._S
-
-    def materialize(self, specs, tag):
-        """bake the edits into a copy of the editable master and register it with ollama"""
-        if not specs and not self.cfg.get("run_quant"):
-            return self.cfg["master_tag"]
-        build = os.path.join(self.state, "build"); os.makedirs(build, exist_ok=True)
-        src = os.path.join(build, "edit.gguf")
-        if specs:
-            from . import edits
-            gguf_io.bake(self.master_blob, src, specs, edits.bake_fn(self.state))
-        else:
-            src = self.master_blob
-        out = src
-        if self.cfg.get("run_quant"):
-            out = os.path.join(build, "run.gguf"); gguf_io.derive_run_quant(src, out, self.cfg["run_quant"])
-        gguf_io.register(tag, out, self.cfg["master_tag"], self.admin)
-        shutil.rmtree(build, ignore_errors=True)
-        return tag
-
-    def add_generation(self, tag, specs, note):
+    def add_generation(self, tag, note):
         n = len(self.lineage["generations"])
-        self.lineage["generations"].append({"gen": n, "tag": tag, "specs": specs, "note": note, "at": time.strftime("%Y-%m-%d %H:%M")})
+        self.lineage["generations"].append({"gen": n, "tag": tag, "note": note, "at": time.strftime("%Y-%m-%d %H:%M")})
         self.lineage["current"] = n; self.s.write("lineage.json", self.lineage)
 
     def setup(self):
         if not self.lineage["generations"]:
             self.status(0, "setup", "preparing generation 0")
-            self.add_generation(self.materialize([], f"rsi-{self.cfg['name']}:g0"), [], "the model as downloaded")
+            tag = self.cfg["master_tag"]
+            if self.cfg.get("run_quant"):   # big models: run a quantized copy, edit the Q8_0 master
+                build = os.path.join(self.state, "build"); os.makedirs(build, exist_ok=True)
+                out = os.path.join(build, "g0.gguf"); gguf_io.derive_run_quant(self.gguf_of(tag), out, self.cfg["run_quant"])
+                tag = f"rsi-{self.cfg['name']}:g0"; gguf_io.register(tag, out, self.cfg["master_tag"], self.admin)
+                shutil.rmtree(build, ignore_errors=True)
+            self.add_generation(tag, "the model as downloaded")
         if not self.fac.meta:
             self.status(0, "setup", "the model is writing practice-problem generators for the goal")
             kept = []
@@ -307,165 +300,138 @@ class Loop:
                     if n not in self.fac.meta:
                         self.fac.add(n, sk, code, frozen=True, origin="built-in")
 
-    # -------- step 2: the model decides what to change about itself
-    def think(self, k, brief, rec):
+    def write_context(self, k, practice_file):
+        json.dump({"goal": self.cfg["goal"], "cycle": k, "generation": self.lineage["current"], "current_model": self.tag,
+                   "current_gguf": self.gguf_of(self.tag), "editable_master_gguf": self.gguf_of(self.cfg["master_tag"]),
+                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json"), "latest_practice_traces": practice_file,
+                   "device": "cuda" if self.hw["cuda"] else "cpu", "hardware": self.hw["label"],
+                   "lineage": self.lineage["generations"]}, open(os.path.join(self.workspace, ".rsi_context.json"), "w"), indent=1)
+
+    # -------- the judge: only this decides whether a model replaces the current one
+    def held_out_test(self, k, cand):
         cfg = self.cfg
-        msgs = [{"role": "system", "content": open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{cfg['goal']}"},
-                {"role": "user", "content": "You just solved fresh practice problems. Here is what happened:\n\n" + json.dumps(brief, indent=1) +
-                 ("\n\nIf useful, first search the web or arXiv for techniques that fit what you see (a few tool calls at most). " if cfg["research"] else "\n\n") +
-                 "Then decide on ONE change to your weights from the menu."}]
-        rec["searches"] = []
-        if cfg["research"]:
-            for _ in range(4):
-                r = llm.chat(cfg, self.tag, msgs, think=cfg["pilot_think"], tools=research.TOOLS, num_predict=cfg["pilot_num_predict"],
-                             live={"slot": "pilot", "title": "reading its traces, deciding what to change"})
-                m = r["message"]; calls = m.get("tool_calls") or []
-                msgs.append({"role": "assistant", "content": m.get("content", ""), **({"tool_calls": calls} if calls else {})})
-                if not calls:
-                    break
-                for c in calls[:2]:
-                    fn = c.get("function", {}); args = fn.get("arguments") or {}
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except ValueError:
-                            args = {}
-                    self.status(k, "think", f"searching: {fn.get('name')} {json.dumps(args)[:80]}")
-                    out = research.execute(fn.get("name", ""), args)
-                    rec["searches"].append({"tool": fn.get("name"), "args": args, "result": out[:600]})
-                    msgs.append({"role": "tool", "content": out[:8000], "tool_name": fn.get("name", "")})
-                self.status(k, "think", "reading its traces, deciding what to change")
-        msgs.append({"role": "user", "content": "Now give your decision as JSON: diagnosis, edit (one of " + ", ".join(EDITS) +
-                                                "), strength (inside that edit's range), why, expect."})
-        for _ in range(3):
-            r = llm.chat(cfg, self.tag, msgs, think=cfg["pilot_think"], fmt=DECISION, num_predict=cfg["pilot_num_predict"],
-                         live={"slot": "pilot", "title": "deciding on one change"})
-            try:
-                d = json.loads(r["message"]["content"])
-                if d.get("edit") in EDITS and isinstance(d.get("strength"), (int, float)):
-                    _, lo, hi = EDITS[d["edit"]]; d["strength"] = round(min(hi, max(lo, float(d["strength"]))), 3)
-                    rec["thinking"] = (r["message"].get("thinking") or "")[-3000:]
-                    return d
-            except ValueError:
-                pass
-            msgs += [{"role": "assistant", "content": r["message"].get("content", "")},
-                     {"role": "user", "content": f"Not valid. Answer with JSON; edit must be one of {list(EDITS)}."}]
-        return None
-
-    # -------- step 3a: turn the decision into a weight edit
-    def make_edit(self, k, d, dev_recs, dev):
-        op, _, _ = EDITS[d["edit"]]
-        if op == "sharpen":
-            return {"op": "sharpen", "strength": d["strength"]}, {}
-        S = self.stream(); specs = self.gen["specs"]
-        if d["edit"] == "stop_second_guessing":
-            byid = {it["id"]: it for it in dev}
-            seqs, caps, y, g = directions.decision_points(S, dev_recs, byid, post_answer_only=True)
-            if (y == 1).sum() < 6:
-                seqs, caps, y, g = directions.decision_points(S, dev_recs, byid, post_answer_only=False)
-            if (y == 1).sum() < 6 or (y == 0).sum() < 6:
-                return None, {"why": f"only {(y == 1).sum()} 'Wait…' moments in its traces: too few to find the direction"}
-            per_layer = S.run(seqs, cands=[specs], capture=caps)[0]["pos"]; key = "doubt"
-        else:
-            rtrain = [r for r in self.ref if r["split"] == "train"][:12]
-            self.status(k, "test", "solving the reference problems to compare its style with the reference")
-            own = llm.solve(self.cfg, self.tag, rtrain, self.traces(self.tag, "reference"), who="reference problems")
-            seqs, caps, y, g = directions.reference_vs_own(S, rtrain, own)
-            per_layer = S.run(seqs, cands=[specs], capture=caps)[0]["span"]; key = "style"
-        rows, D = directions.stats(per_layer, y, g)
-        L = S.L; good = [r for r in rows if r["layer"] >= L // 3 and r["heldout_auc"] is not None]
-        best = max(good, key=lambda r: r["heldout_auc"]) if good else rows[2 * L // 3]
-        os.makedirs(os.path.join(self.state, "dirs"), exist_ok=True)
-        dfile = f"dirs/{key}-c{k}.npz"; np.savez(os.path.join(self.state, dfile), d=D)
-        return ({"op": op, "dir": dfile, "dir_layer": best["layer"], "layers": [L // 2, L - 1], "strength": d["strength"]},
-                {"layer": best["layer"], "auc": best["heldout_auc"], "samples": f"{int((y == 1).sum())}+{int((y == 0).sum())}"})
-
-    # -------- one cycle
-    def cycle(self, k, direction):
-        cfg = self.cfg; t0 = time.time(); gen0 = self.gen
-        rec = {"cycle": k, "generation": gen0["gen"], "direction": direction, "started": time.strftime("%H:%M")}
-        dtext = (direction or {}).get("text") if isinstance(direction, dict) else direction
-        # 1 observe
-        dev = self.fac.sample("dev", k, cfg["n_dev_per_family"])
-        self.status(k, "observe", f"solving {len(dev)} fresh practice problems")
-        recs = llm.solve(cfg, self.tag, dev, self.traces(self.tag, f"practice-c{k}"), who="practice")
-        summ, D = detectors.summarize(recs)
-        self.fac.update_levels(recs)
-        rec["practice"] = {"n": len(recs), "accuracy": round(float(np.mean([r["correct"] for r in recs])), 3),
-                           "unfinished": summ["counts"]["unfinished"], "doubt_after_answer": summ["doubt_events_after_answer"],
-                           "doubt_total": summ["doubt_events_total"]}
-        brief = {"goal": cfg["goal"], "plan_for_this_cycle": dtext or "(none yet: your call)",
-                 "plan_came_from": (direction or {}).get("from", "") if isinstance(direction, dict) else "", "practice_results": rec["practice"],
-                 "accuracy_by_problem_type": summ["accuracy_by_suite"], "patterns_by_outcome": summ["detectors_mean_by_outcome"],
-                 "failing_traces": detectors.excerpts(recs, D, k=3, width=600),
-                 "earlier_cycles": [{"edit": h.get("edit"), "strength": h.get("strength"), "kept": h.get("kept"), "result": h.get("summary")}
-                                    for h in self.s.history()[-6:]],
-                 "menu": {n: f"{op}, strength {lo}-{hi}" for n, (op, lo, hi) in EDITS.items()}}
-        # 2 think
-        self.status(k, "think", "reading its traces, deciding what to change")
-        d = self.think(k, brief, rec)
-        if d is None:
-            if gen0["gen"] > 0:   # the edited model can no longer run the loop: undo the last edit
-                self.lineage["current"] = gen0["gen"] - 1; self.s.write("lineage.json", self.lineage)
-                rec.update(kept=False, summary=f"generation {gen0['gen']} could not produce a valid decision; reverted to generation {gen0['gen'] - 1}")
-                return rec
-            d = {"diagnosis": "(no valid decision from the model)", "edit": "stop_second_guessing", "strength": 0.5,
-                 "why": "fallback: the model did not produce a valid decision", "expect": "fewer doubt loops"}
-        rec.update(diagnosis=d["diagnosis"], edit=d["edit"], strength=d["strength"], why=d["why"], expect=d["expect"])
-        # 3 edit + test
-        self.status(k, "test", f"finding where '{d['edit']}' lives in its weights")
-        spec, info = self.make_edit(k, d, recs, dev)
-        rec["edit_info"] = info
-        if spec is None:
-            rec.update(kept=False, summary=f"skipped: {info.get('why')}"); return rec
-        ctag = f"rsi-{cfg['name']}:g{len(self.lineage['generations'])}"
-        self.status(k, "test", f"baking {d['edit']} ({d['strength']}) into a copy of its weights")
-        self.materialize(gen0["specs"] + [spec], ctag)
-        n0 = cfg["n_general"]; start = (k * n0) % max(1, len(self.general) - n0)
+        n0 = cfg["n_general"]; start = (k * n0 + self.fac.secret) % max(1, len(self.general) - n0)
         focus = self.fac.sample("heldout", k, cfg["n_test_per_family"]); general = self.general[start:start + n0]
-        self.status(k, "test", f"current model on {len(focus) + len(general)} fresh test problems")
-        a = llm.solve(cfg, self.tag, focus + general, self.traces(self.tag, f"test-c{k}"), who="test, current model")
-        self.status(k, "test", f"edited model on the same {len(focus) + len(general)} problems")
-        b = llm.solve(cfg, ctag, focus + general, self.traces(ctag, f"test-c{k}"), who="test, edited model")
+        self.status(k, "test", f"held-out test: current model on {len(focus) + len(general)} fresh problems")
+        a = llm.solve(cfg, self.tag, focus + general, os.path.join(self.state, "tests", f"c{k}-current.jsonl"), who="held-out test, current model")
+        self.status(k, "test", f"held-out test: {cand} on the same problems")
+        b = llm.solve(cfg, cand, focus + general, os.path.join(self.state, "tests", f"c{k}-candidate.jsonl"), who=f"held-out test, {cand}")
         fp = compare(a, b, [it["id"] for it in focus]); gp = compare(a, b, [it["id"] for it in general])
         keep = fp["fixed"] - fp["broken"] >= cfg["min_gain"] and gp["broken"] - gp["fixed"] <= cfg["max_general_loss"]
-        # 4 keep or revert
+        verdict = (f"goal {fp['before']:.0%} → {fp['after']:.0%} (+{fp['fixed']}/−{fp['broken']}), general {gp['before']:.0%} → "
+                   f"{gp['after']:.0%} (+{gp['fixed']}/−{gp['broken']}): " + ("KEPT, it is now the current model" if keep else
+                   f"not kept (needs +{cfg['min_gain']} net on the goal and at most −{cfg['max_general_loss']} net on general problems)"))
         if keep:
-            self.add_generation(ctag, gen0["specs"] + [spec], f"cycle {k}: {d['edit']} {d['strength']}")
-        else:
-            gguf_io.unregister(ctag, self.admin)
-        rec.update(test={"goal": fp, "general": gp}, kept=keep, generation_after=self.lineage["current"], minutes=round((time.time() - t0) / 60, 1),
-                   summary=f"{d['edit']} {d['strength']}: goal {fp['before']:.0%} → {fp['after']:.0%} (+{fp['fixed']}/−{fp['broken']}), "
-                           f"general {gp['before']:.0%} → {gp['after']:.0%} (+{gp['fixed']}/−{gp['broken']}): {'KEPT' if keep else 'reverted'}")
+            self.add_generation(cand, f"cycle {k}")
+        self.note("result", "held-out test: " + verdict)
+        return {"kept": keep, "goal": fp, "general": gp, "verdict": verdict}
+
+    # -------- one cycle: practice, then the model works on itself with tools
+    def cycle(self, k, direction):
+        from .tools import TOOLS, Toolbox
+        cfg = self.cfg; t0 = time.time(); self.cycle_k = k; self.transcript = []
+        rec = {"cycle": k, "generation": self.lineage["current"], "model": self.tag, "direction": direction, "started": time.strftime("%H:%M")}
+        # 1 practice (the loop does this, so every cycle starts from fresh evidence)
+        dev = self.fac.sample("dev", k * 100, self.cfg["n_dev_per_family"])
+        self.status(k, "practice", f"solving {len(dev)} fresh practice problems")
+        pfile = os.path.join(self.workspace, "practice", f"current-c{k}.jsonl")
+        recs = llm.solve(cfg, self.tag, dev, pfile, who="practice")
+        summ, D = detectors.summarize(recs); self.fac.update_levels(recs)
+        rec["practice"] = {"accuracy": round(float(np.mean([r["correct"] for r in recs])), 3), "n": len(recs),
+                           "unfinished": summ["counts"]["unfinished"], "doubt_after_answer": summ["doubt_events_after_answer"]}
+        self.write_context(k, os.path.relpath(pfile, self.workspace))
+        # 2 work: a free tool-using episode
+        tb = Toolbox(self, k)
+        brief = {"goal": cfg["goal"], "cycle": k, "you_are": f"{self.tag} (generation {self.lineage['current']})",
+                 "plan_for_this_cycle": (direction or {}).get("text") or "(your call)", "plan_came_from": (direction or {}).get("from", ""),
+                 "practice_just_now": rec["practice"], "accuracy_by_problem_type": summ["accuracy_by_suite"],
+                 "failure_patterns_by_outcome": summ["detectors_mean_by_outcome"], "failing_excerpts": detectors.excerpts(recs, D, k=2, width=500),
+                 "practice_traces_file": os.path.relpath(pfile, self.workspace),
+                 "earlier_cycles": [{"cycle": h.get("cycle"), "summary": h.get("summary"), "submitted": (h.get("submitted") or {}).get("model"),
+                                     "verdict": (h.get("submitted") or {}).get("verdict")} for h in self.s.history()[-6:]],
+                 "your_models": tb._owned(), "workspace_files": tb.t_list_files()[:3000],
+                 "budget": f"up to {cfg['max_steps']} tool calls and about {cfg['max_cycle_minutes']} minutes this cycle"}
+        msgs = [{"role": "system", "content": open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{cfg['goal']}"},
+                {"role": "user", "content": "A new cycle. Here is where you stand:\n\n" + json.dumps(brief, indent=1, default=str)}]
+        self.status(k, "work", "working on itself"); self.note("note", f"cycle {k} begins; practice accuracy {rec['practice']['accuracy']:.0%}")
+        seen = len(self._inbox()); nudges = late = 0
+        for step in range(cfg["max_steps"]):
+            if time.time() - t0 > cfg["max_cycle_minutes"] * 60:
+                if late > 2:
+                    break
+                late += 1; msgs.append({"role": "user", "content": "Time is up for this cycle: call finish now."})
+            for t in self._inbox()[seen:]:   # you can talk to it while it works
+                if t:
+                    msgs.append({"role": "user", "content": f"Message from the human: {t}"}); self.note("human", t)
+            seen = len(self._inbox())
+            r = llm.chat(cfg, self.tag, self._trim(msgs), think=cfg["pilot_think"], tools=TOOLS, num_predict=cfg["pilot_num_predict"],
+                         live={"slot": "pilot", "title": f"working on itself (step {step + 1})"})
+            m = r["message"]; calls = m.get("tool_calls") or []
+            msgs.append({"role": "assistant", "content": m.get("content", ""), **({"tool_calls": calls} if calls else {})})
+            if m.get("content", "").strip():
+                self.note("model", m["content"])
+            if not calls:
+                nudges += 1
+                if nudges > 2:
+                    break
+                msgs.append({"role": "user", "content": "Use your tools to make progress on the goal. When you are done, call finish."}); continue
+            for c in calls[:3]:
+                fn = c.get("function", {}); args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                self.note("call", f"{fn.get('name')}({json.dumps(args)[:1500]})")
+                self.status(k, "work", f"{fn.get('name')} …")
+                out = tb.call(fn.get("name", ""), args if isinstance(args, dict) else {})
+                self.note("result", out[:3000])
+                msgs.append({"role": "tool", "content": out, "tool_name": fn.get("name", "")})
+            if tb.finished:
+                break
+        # 3 test happened inside submit (if the model submitted); 4 plan comes from finish
+        fin = tb.finished or {}
+        if not fin:
+            plans, pick, reason = self.plan_next(k, rec, tb)
+            fin = {"summary": "(the model did not call finish)", "next_plans": plans, "picked": pick, "pick_reason": reason}
+        rec.update(summary=fin["summary"], next_plans=fin["next_plans"], picked=fin["picked"], pick_reason=fin.get("pick_reason", ""),
+                   submitted=tb.submitted, kept=bool(tb.submitted and tb.submitted.get("kept")), tools_used=len(tb.log),
+                   tool_log=tb.log[-60:], generation_after=self.lineage["current"], minutes=round((time.time() - t0) / 60, 1))
         return rec
 
-    def plan_next(self, k, rec):
-        """step 5: the model looks at what just happened, proposes plans for the next cycle and picks one"""
-        cfg = self.cfg
-        self.status(k, "plan", "proposing plans for the next cycle and picking one")
-        recent = [{"cycle": h.get("cycle"), "edit": h.get("edit"), "strength": h.get("strength"), "kept": h.get("kept"), "result": h.get("summary")}
-                  for h in self.s.history()[-6:]] + [{"cycle": k, "edit": rec.get("edit"), "strength": rec.get("strength"), "kept": rec.get("kept"),
-                                                     "result": rec.get("summary"), "diagnosis": rec.get("diagnosis"), "why": rec.get("why")}]
-        msgs = [{"role": "system", "content": open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{cfg['goal']}"},
-                {"role": "user", "content": "Cycle results so far (newest last):\n" + json.dumps(recent, indent=1) +
-                 f"\n\nYou are now generation {self.lineage['current']}. Propose 2 to 4 concrete plans for the next cycle (which "
-                 "failure to target, which change from the menu, or what to try differently, and why), then pick the one most likely "
-                 "to make real progress on the goal. Don't repeat a reverted change unless you change something material."}]
-        for _ in range(2):
-            try:
-                r = llm.chat(cfg, self.tag, msgs, think=cfg["pilot_think"], fmt=PLANS, num_predict=cfg["pilot_num_predict"],
-                             live={"slot": "pilot", "title": "planning the next cycle"})
-                d = json.loads(r["message"]["content"])
-                plans = [p for p in d.get("plans", []) if isinstance(p, dict) and p.get("plan")][:4]
-                if plans:
-                    pick = min(max(int(d.get("pick", 0)), 0), len(plans) - 1)
-                    return plans, pick, d.get("reason", "")
-            except Exception:  # noqa: BLE001
-                continue
-        return [{"plan": "re-diagnose the current model and try the change that best fits its most common failure", "why": "fallback"}], 0, "fallback"
+    def _inbox(self):
+        p = self.s.p("inbox.jsonl")
+        return [json.loads(l)["text"].strip() for l in open(p).read().splitlines()] if os.path.exists(p) else []
+
+    def _trim(self, msgs, budget=None):
+        """keep the conversation inside the context window: shorten old tool results first"""
+        budget = budget or self.cfg["num_ctx"] * 3
+        size = lambda: sum(len(str(m.get("content", ""))) for m in msgs)
+        for m in msgs[2:-6]:
+            if size() <= budget:
+                break
+            if m["role"] == "tool" and len(m["content"]) > 400:
+                m["content"] = m["content"][:200] + " …[shortened]… " + m["content"][-150:]
+        return msgs
+
+    def plan_next(self, k, rec, tb):
+        """fallback when the model never called finish: ask it directly for plans"""
+        msgs = [{"role": "system", "content": open(PLAYBOOK).read()},
+                {"role": "user", "content": f"Cycle {k} ended. What you did: " + json.dumps(tb.log[-12:], default=str)[:6000] +
+                 "\n\nPropose 2 to 4 plans for the next cycle and pick one."}]
+        try:
+            r = llm.chat(self.cfg, self.tag, msgs, think=self.cfg["pilot_think"], fmt=PLANS, num_predict=self.cfg["pilot_num_predict"],
+                         live={"slot": "pilot", "title": "planning the next cycle"})
+            d = json.loads(r["message"]["content"])
+            plans = [p.get("plan") if isinstance(p, dict) else str(p) for p in d.get("plans", [])][:4]
+            if plans:
+                return plans, min(max(int(d.get("pick", 0)), 0), len(plans) - 1), d.get("reason", "")
+        except Exception:  # noqa: BLE001
+            pass
+        return ["look at the practice traces and try one concrete change to my weights"], 0, "fallback"
 
     def run(self):
-        open(self.s.p("loop.pid"), "w").write(str(os.getpid()))
+        open(self.s.p("loop.pid"), "w").write(str(os.getpid())); self.cycle_k = 0
 
         def term(*_):
             try:
@@ -475,24 +441,17 @@ class Loop:
             os._exit(0)
         signal.signal(signal.SIGTERM, term)
         self.setup()
-        hist = self.s.history(); k = len(hist)
-        direction = None
+        hist = self.s.history(); k = len(hist); direction = None
         if hist and hist[-1].get("next_plans"):   # resuming: carry on with the plan picked last time
-            last = hist[-1]; direction = {"from": "model", "text": last["next_plans"][last.get("picked", 0)]["plan"]}
-        seen = sum(1 for _ in open(self.s.p("inbox.jsonl"))) if os.path.exists(self.s.p("inbox.jsonl")) else 0
+            last = hist[-1]; direction = {"from": "model", "text": last["next_plans"][last.get("picked", 0)]}
+        seen = len(self._inbox())
         while True:
-            lines = open(self.s.p("inbox.jsonl")).read().splitlines() if os.path.exists(self.s.p("inbox.jsonl")) else []
-            for l in lines[seen:]:
-                t = json.loads(l)["text"].strip()
-                if t:
-                    direction = {"from": "human", "text": t}   # your direction beats the model's own pick
-            seen = len(lines)
+            texts = [t for t in self._inbox()[seen:] if t]; seen = len(self._inbox())
+            if texts:
+                direction = {"from": "human", "text": texts[-1]}   # your direction beats the model's own pick
             try:
                 rec = self.cycle(k, direction)
-                if not rec.get("summary", "").startswith("error"):
-                    plans, pick, reason = self.plan_next(k, rec)
-                    rec.update(next_plans=plans, picked=pick, pick_reason=reason)
-                    direction = {"from": "model", "text": plans[pick]["plan"]}
+                direction = {"from": "model", "text": rec["next_plans"][rec["picked"]]}
             except Exception as e:  # noqa: BLE001
                 rec = {"cycle": k, "generation": self.lineage["current"], "kept": False, "summary": f"error: {type(e).__name__}: {e}",
                        "trace": traceback.format_exc()[-2000:]}

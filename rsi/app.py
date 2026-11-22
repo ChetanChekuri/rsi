@@ -2,7 +2,7 @@
 plans it made for the next cycle, and every cycle so far. Bottom: type to steer the next cycle (optional).
 
     rsi            open the loop for this folder (in a new folder: pick a model and a goal first)
-    rsi stop       stop this folder's loop
+    rsi stop       stop this folder's loop (until you open rsi there again)
 """
 import glob, json, os, sys, time
 from rich.console import Group
@@ -16,7 +16,8 @@ from textual.widgets import Button, Footer, Input, Label, Select, Static, TextAr
 from .loop import Session, create, models, plan
 
 ACC, WARN, GOOD, BAD, DIM = "#5fd7d7", "#ffd75f", "#87d787", "#ff8787", "grey58"
-STEPS = ["observe", "think", "test", "plan"]
+STEPS = ["practice", "work", "test", "plan"]
+KIND = {"call": (ACC, "→ "), "result": ("#8a98a3", "  "), "model": ("#e6edf2", ""), "human": (WARN, "you: "), "note": (GOOD, "· ")}
 CSS = """
 Screen { background: #1b1e23; }
 #top { height: 3; padding: 0 1; background: #22272e; }
@@ -69,32 +70,36 @@ class New(Screen):
 
 
 def live_view(sd):
-    """the most recent generation (the model thinking about itself, or solving a problem)"""
-    fs = [f for f in glob.glob(os.path.join(sd, "live", "*.json"))]
-    if not fs:
-        return "", Text("nothing yet", style=DIM)
-    f = max(fs, key=os.path.getmtime)
-    try:
-        d = json.load(open(f))
-    except (OSError, ValueError):
-        return "", Text("")
-    live = not d.get("done") and time.time() - d.get("updated", 0) < 15
-    who = "the model, about itself" if os.path.basename(f).startswith("pilot") else "the model, solving"
-    title = f"{who}: {d.get('title', '')}" + ("   ● live" if live else "   (finished)")
+    """the agent's transcript (its messages, tool calls and results, your messages) and, below it, what it is
+    generating right now"""
     parts = []
-    if d.get("prompt"):
-        parts += [Text(d["prompt"], style="#c8d3da")]
-        if d.get("gold"):
-            parts += [Text(f"answer key: {d['gold']}", style=DIM)]
-        parts += [Text("")]
-    if d.get("thinking"):
-        parts += [Text("thinking", style=f"bold {WARN}"), Text(d["thinking"], style="italic #aebbc4"), Text("")]
-    for c in d.get("tool_calls") or []:
-        fn = c.get("function", {})
-        parts += [Text(f"→ {fn.get('name')}({json.dumps(fn.get('arguments'))[:200]})", style=f"bold {ACC}")]
-    if d.get("content"):
-        parts += [Text("answer", style=f"bold {GOOD}"), Text(d["content"])]
-    return title, Group(*parts)
+    try:
+        tr = json.load(open(os.path.join(sd, "live", "transcript.json")))
+        for e in tr.get("entries", [])[-40:]:
+            color, prefix = KIND.get(e["kind"], (DIM, ""))
+            text = e["text"] if e["kind"] != "result" else e["text"][:1200]
+            parts.append(Text.assemble((e["t"] + " ", DIM), (prefix + text, color)))
+    except (OSError, ValueError):
+        pass
+    fs = [f for f in glob.glob(os.path.join(sd, "live", "*.json")) if not f.endswith("transcript.json")]
+    title = "live"
+    if fs:
+        f = max(fs, key=os.path.getmtime)
+        try:
+            d = json.load(open(f))
+            live = not d.get("done") and time.time() - d.get("updated", 0) < 15
+            title = d.get("title", "") + ("   ● live" if live else "")
+            if live or not parts:
+                parts.append(Text(""))
+                if d.get("prompt"):
+                    parts += [Text(d["prompt"], style="#c8d3da")] + ([Text(f"answer key: {d['gold']}", style=DIM)] if d.get("gold") else [])
+                if d.get("thinking"):
+                    parts += [Text("thinking", style=f"bold {WARN}"), Text(d["thinking"][-6000:], style="italic #aebbc4")]
+                if d.get("content"):
+                    parts += [Text("answer", style=f"bold {GOOD}"), Text(d["content"][-3000:])]
+        except (OSError, ValueError):
+            pass
+    return title, Group(*parts) if parts else Text("nothing yet", style=DIM)
 
 
 class Main(Screen):
@@ -112,7 +117,7 @@ class Main(Screen):
                 yield Static(id="now")
                 with VerticalScroll(id="cycles-box"):
                     yield Static(id="cycles")
-        yield Input(placeholder="optional: type a direction for the next cycle (otherwise the model follows its own plan)", id="prompt")
+        yield Input(placeholder="talk to the model while it works; your message also sets the next cycle's direction", id="prompt")
         yield Footer()
 
     def on_mount(self):
@@ -128,13 +133,14 @@ class Main(Screen):
     def tick(self):
         cfg, st = self.s.cfg, self.s.read("status.json", {}) or {}
         lin = self.s.read("lineage.json", {}) or {}; hist = self.s.history(); running = bool(self.s.pid())
-        if not running and time.time() - self.restarted > 60:   # the loop died (crash, reboot): bring it back, resuming
+        if not running and not self.s.stopped() and time.time() - self.restarted > 60:   # died (crash, reboot): resume it
             self.s.start(); self.restarted = time.time()
         step = st.get("step", "starting")
         top = Text.assemble((" rsi ", f"bold black on {ACC}"), (f"  {cfg['model']}", "bold"), (f"   generation {lin.get('current', 0)}", ACC),
                             (f"   cycle {st.get('cycle', 0)}", DIM), ("   ", ""),
                             (f" {step.upper()} ", f"bold black on {BAD if (not running or step == 'error') else ACC}"),
-                            ("" if running else "  loop not running: restarting", BAD), (f"   {st.get('device', '')}", DIM),
+                            ("" if running else ("  stopped (rsi stop); open rsi here again to resume" if self.s.stopped() else "  loop not running: restarting"), BAD),
+                            (f"   {st.get('device', '')}", DIM),
                             (f"\n goal: {cfg['goal'][:150]}", f"italic {WARN}"))
         self.query_one("#top", Static).update(top)
 
@@ -156,31 +162,34 @@ class Main(Screen):
             line.append("● " if on_ else "○ ", ACC if on_ else DIM); line.append(s_ + "    ", f"bold {ACC}" if on_ else DIM)
         now = [line, Text(st.get("detail", ""), style="bold")]
         if hist:
-            h = hist[-1]
-            now += [Text(""), Text("last cycle", style=DIM), Text(h.get("summary", ""), style=GOOD if h.get("kept") else BAD)]
-            if h.get("why"):
-                now += [Text(f"why it chose that: {h['why']}", style="italic")]
-            if h.get("searches"):
-                now += [Text("it searched: " + "; ".join(f"{x['tool']} {json.dumps(x['args'])[:60]}" for x in h["searches"]), style=DIM)]
+            h = hist[-1]; sub = h.get("submitted") or {}
+            now += [Text(""), Text(f"last cycle ({h.get('tools_used', 0)} tool calls, {h.get('minutes', '?')} min)", style=DIM),
+                    Text(h.get("summary", ""), style="italic")]
+            if sub:
+                now += [Text(f"submitted {sub.get('model')}: {sub.get('verdict', '')}", style=GOOD if sub.get("kept") else BAD)]
             if h.get("next_plans"):
                 now += [Text(""), Text("its plans for the next cycle", style=DIM)]
                 for i, p in enumerate(h["next_plans"]):
                     chosen = i == h.get("picked", 0)
-                    now += [Text(("▶ " if chosen else "  ") + p["plan"], style=f"bold {ACC}" if chosen else DIM)]
+                    now += [Text(("▶ " if chosen else "  ") + str(p), style=f"bold {ACC}" if chosen else DIM)]
                 if h.get("pick_reason"):
                     now += [Text(f"picked because: {h['pick_reason']}", style="italic")]
+        models = self.s.read("state/models.json", []) or []
+        if models:
+            now += [Text(""), Text("models it has built: " + ", ".join(m["tag"].split(":")[-1] for m in models[-6:]), style=DIM)]
         self.query_one("#now", Static).update(Group(*now))
         # all cycles
         tb = Table(box=None, expand=True, header_style=f"bold {ACC}", pad_edge=False)
-        for c in ("#", "plan from", "change it chose", "goal before → after", "general", ""):
+        for c in ("#", "gen", "practice", "plan from", "submitted", "held-out (goal)", ""):
             tb.add_column(c)
         for h in reversed(hist):
-            t = h.get("test") or {}; g, gg = t.get("goal") or {}, t.get("general") or {}
-            src = (h.get("direction") or {}).get("from", "goal") if isinstance(h.get("direction"), dict) else ("you" if h.get("direction") else "goal")
-            tb.add_row(str(h["cycle"]), {"human": "you", "model": "itself"}.get(src, src), f"{h.get('edit', '-')} {h.get('strength', '')}",
+            sub = h.get("submitted") or {}; g = sub.get("goal") or {}
+            src = (h.get("direction") or {}).get("from", "goal") if isinstance(h.get("direction"), dict) else "goal"
+            tb.add_row(str(h["cycle"]), str(h.get("generation", "")), f"{(h.get('practice') or {}).get('accuracy', 0):.0%}",
+                       {"human": "you", "model": "itself"}.get(src, src), (sub.get("model") or "-").split(":")[-1],
                        f"{g['before']:.0%} → {g['after']:.0%}" if g.get("before") is not None else "-",
-                       f"{gg['before']:.0%} → {gg['after']:.0%}" if gg.get("before") is not None else "-",
-                       Text("kept" if h.get("kept") else ("reverted" if g else (h.get("summary") or "")[:30]), style=GOOD if h.get("kept") else BAD))
+                       Text("kept" if h.get("kept") else ("not kept" if sub else (h.get("summary", "")[:24] if h.get("summary", "").startswith("error") else "")),
+                            style=GOOD if h.get("kept") else BAD))
         self.query_one("#cycles-box", VerticalScroll).border_title = f"cycles ({len(hist)})"
         self.query_one("#cycles", Static).update(tb if hist else Text("the first cycle is running", style=DIM))
 
@@ -190,7 +199,7 @@ class Main(Screen):
         if not text:
             return
         self.s.post(text)
-        self.notify("got it: the next cycle will follow your direction instead of the model's own pick", timeout=4)
+        self.notify("sent: the model reads it at its next step, and the next cycle follows it instead of its own pick", timeout=4)
 
 
 class RSI(App):

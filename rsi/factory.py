@@ -10,7 +10,7 @@ Integrity rules:
     with seeds from a range dev never uses. Later generations can add dev-only families but cannot shape the test.
   - each family has a difficulty level 1..5, adapted from dev accuracy so the model stays in the informative 30-80% band.
 """
-import hashlib, json, os, re, time
+import hashlib, json, os, re, time, secrets
 import numpy as np
 from . import sandbox
 from .probes import SUFFIX
@@ -127,6 +127,12 @@ class Factory:
         self.dir = os.path.join(state_dir, "factory"); os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, "families.json")
         self.meta = json.load(open(self.path)) if os.path.exists(self.path) else {}
+        # held-out seeds are offset by a secret kept outside the sandbox: the model can run any code, and without this
+        # it could regenerate its own test problems and train on them
+        sp = os.path.join(self.dir, "secret")
+        if not os.path.exists(sp):
+            open(sp, "w").write(str(secrets.randbelow(10 ** 6) + 1)); os.chmod(sp, 0o600)
+        self.secret = int(open(sp).read())
 
     def save(self):
         json.dump(self.meta, open(self.path, "w"), indent=1)
@@ -146,7 +152,7 @@ class Factory:
 
     def sample(self, split, cycle, n_per_family):
         """fresh items; held-out only from frozen families, from a seed range dev never touches"""
-        base = (10 ** 9 if split == "heldout" else 0) + int(cycle) * 10_000
+        base = (10 ** 9 + self.secret * 10 ** 7 if split == "heldout" else 0) + int(cycle) * 10_000
         out = []
         for name, m in self.meta.items():
             if split == "heldout" and not m["frozen"]:
