@@ -1,0 +1,7 @@
+#!/bin/bash
+# rsi: open the self-improvement loop for the current folder (or the folder given), or `rsi stop` to stop it.
+SELF="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+[ -f "$SELF/.env" ] && set -a && . "$SELF/.env" && set +a          # machine-specific settings (not committed)
+PY="${RSI_PYTHON:-$( [ -x "$SELF/.venv/bin/python" ] && echo "$SELF/.venv/bin/python" || echo python3 )}"
+export PYTHONPATH="$SELF${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m rsi.app "$@"

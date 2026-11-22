@@ -1,0 +1,121 @@
+"""GGUF access for qwen35-family models (Qwen3.5 0.8B ... Qwen3.8 27B).
+
+- metadata + per-tensor dequantization for any ggml type gguf-py understands (Q8_0, K-quants, F16, BF16, ...)
+- baking a list of edit specs into a copy of the master GGUF *in place* (byte layout unchanged), which requires the
+  edited tensors to be Q8_0 / F16 / BF16 / F32. Use a Q8_0 master (e.g. qwen3.8:27b-q8_0) for large models.
+- deriving a smaller run quantization with llama.cpp's llama-quantize (bundled with ollama)
+- registering a GGUF with ollama, reusing the base model's Modelfile (projector, renderer, parser, parameters)
+"""
+import os, re, shutil, subprocess, tempfile
+import numpy as np, gguf
+from gguf import quants
+
+INPLACE = {"Q8_0", "F16", "BF16", "F32"}
+
+
+def q8_0(W):
+    """Q8_0 quantization identical to llama.cpp for already-representable values (validated byte-exact on qwen35)."""
+    x = W.reshape(W.shape[0], -1, 32).astype(np.float32); s = np.abs(x).max(-1, keepdims=True) / 127.0
+    inv = np.divide(1.0, s, out=np.zeros_like(s), where=s != 0)
+    q = np.clip(np.rint(x * inv), -127, 127).astype(np.int8)
+    o = np.empty((W.shape[0], x.shape[1], 34), np.uint8)
+    o[..., :2] = s.astype(np.float16).view(np.uint8); o[..., 2:] = q.view(np.uint8)
+    return o.reshape(W.shape[0], -1)
+
+
+class GGUF:
+    def __init__(self, path, mode="r"):
+        self.path = path
+        self.r = gguf.GGUFReader(path, mode)
+        self.arch = self.r.fields["general.architecture"].contents()
+        self.T = {t.name: t for t in self.r.tensors}
+
+    def meta(self, key, default=None):
+        f = self.r.fields.get(f"{self.arch}.{key}")
+        return default if f is None else f.contents()
+
+    def shape(self, name):
+        """logical numpy shape: (rows = output dim, cols = input dim) for matrices"""
+        return tuple(int(x) for x in reversed(self.T[name].shape))
+
+    def deq(self, name, rows=None):
+        t = self.T[name]; data = t.data if rows is None else t.data[rows]
+        tn = t.tensor_type.name
+        if tn == "F32":
+            out = np.asarray(data, dtype=np.float32)
+        elif tn == "F16":
+            out = np.asarray(data).astype(np.float32)
+        else:
+            out = quants.dequantize(np.asarray(data), t.tensor_type).astype(np.float32)
+        if rows is None:
+            return out.reshape(self.shape(name))
+        return out.reshape(len(np.asarray(rows).reshape(-1)), *self.shape(name)[1:])
+
+    def write(self, name, W):
+        """overwrite tensor `name` in place (file opened with mode='r+')"""
+        t = self.T[name]; tn = t.tensor_type.name
+        assert tn in INPLACE, f"{name} is {tn}; in-place baking needs a Q8_0/F16/BF16/F32 master"
+        if tn == "Q8_0":
+            new = q8_0(W)
+        elif tn == "F32":
+            new = W.astype(np.float32)
+        elif tn == "F16":
+            new = W.astype(np.float16)
+        else:
+            new = quants.quantize(W.astype(np.float32), t.tensor_type)
+        t.data[...] = new.reshape(t.data.shape).view(t.data.dtype)
+
+
+def writers(g, l):
+    """residual writers of layer l: mixer output (ssm_out or attn_output) and MLP down-projection"""
+    p = f"blk.{l}."
+    mix = p + "ssm_out.weight" if p + "ssm_out.weight" in g.T else p + "attn_output.weight"
+    return [mix, p + "ffn_down.weight"]
+
+
+def _env(host=None):
+    return dict(os.environ, OLLAMA_HOST=host) if host else None
+
+
+def ollama_show(tag, host=None):
+    mf = subprocess.run(["ollama", "show", "--modelfile", tag], capture_output=True, text=True, check=True, env=_env(host)).stdout
+    froms = re.findall(r"^FROM (\S+)", mf, re.M)
+    return froms[0], mf
+
+
+def bake(base_path, out_path, specs, edit_fn):
+    """copy base GGUF and apply `specs` in order. edit_fn(g, name, W, specs) -> W' or None (untouched)."""
+    shutil.copyfile(base_path, out_path)
+    g = GGUF(out_path, "r+"); n = 0
+    for name in list(g.T):
+        if not (name == "output_norm.weight" or re.match(r"blk\.\d+\.(ssm_out|attn_output|ffn_down)\.weight$", name)):
+            continue
+        W = g.deq(name)
+        W2 = edit_fn(g, name, W, specs)
+        if W2 is not None:
+            g.write(name, W2); n += 1
+    g.r.data.flush(); del g
+    return n
+
+
+def derive_run_quant(src, dst, qtype, llama_quantize="/usr/local/lib/ollama/llama-quantize"):
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(llama_quantize) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
+    subprocess.run([llama_quantize, "--allow-requantize", src, dst, qtype], check=True, env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def register(tag, gguf_path, base_tag, host=None):
+    """ollama create `tag` from gguf_path, keeping every other Modelfile line of base_tag. `host` must be a server
+    allowed to write the model store (a user-level capped server usually is not)."""
+    blob, mf = ollama_show(base_tag, host)
+    mf = mf.replace(f"FROM {blob}", f"FROM {os.path.abspath(gguf_path)}", 1)
+    with tempfile.NamedTemporaryFile("w", suffix=".Modelfile", delete=False) as f:
+        f.write(mf); path = f.name
+    try:
+        subprocess.run(["ollama", "create", tag, "-f", path], check=True, capture_output=True, env=_env(host))
+    finally:
+        os.unlink(path)
+
+
+def unregister(tag, host=None):
+    subprocess.run(["ollama", "rm", tag], capture_output=True, env=_env(host))
