@@ -4,8 +4,10 @@
   2 think    the model reads its own failing traces (and may search the web), then picks ONE change to its weights
   3 test     the change is baked into a copy of the weights; both versions solve the same fresh held-out problems
   4 keep     the copy becomes the model if it solves more of them without getting worse at general problems
+  5 plan     the (possibly new) model proposes plans for the next cycle, picks one, and the loop moves on
 
-Then it waits for you: press Enter for the next cycle, or type what it should work on.
+You give one main prompt (the goal) at the start; after that it runs on its own. Anything you type is used as the
+direction for the next cycle instead of the model's own pick.
 Everything lives in <folder>/.rsi/. The app starts this process (python -m rsi.loop <folder>); it keeps running
 when the app is closed.
 """
@@ -21,6 +23,10 @@ PLAYBOOK = os.path.join(ROOT, "rsi", "playbook.md")
 # the menu of changes the model can make to itself: name -> (operator, min strength, max strength)
 EDITS = {"stop_second_guessing": ("ablate", 0.1, 0.9), "be_more_decisive": ("sharpen", 1.05, 1.8),
          "be_less_decisive": ("sharpen", 0.6, 0.95), "reason_like_reference": ("amplify", 0.05, 0.6)}
+PLANS = {"type": "object", "properties": {
+    "plans": {"type": "array", "items": {"type": "object", "properties": {"plan": {"type": "string"}, "why": {"type": "string"}},
+                                         "required": ["plan", "why"]}},
+    "pick": {"type": "integer"}, "reason": {"type": "string"}}, "required": ["plans", "pick", "reason"]}
 DECISION = {"type": "object", "properties": {
     "diagnosis": {"type": "string"}, "edit": {"type": "string", "enum": list(EDITS)}, "strength": {"type": "number"},
     "why": {"type": "string"}, "expect": {"type": "string"}}, "required": ["diagnosis", "edit", "strength", "why", "expect"]}
@@ -75,7 +81,7 @@ class Session:
         if self.pid():
             return self.pid()
         cmd = [sys.executable, "-u", "-m", "rsi.loop", self.folder]
-        cap = self.cfg.get("memory_cap")
+        cap = sizing(hardware(), self.cfg.get("small", True))["memory_cap"]   # decided for this machine, now
         if cap and shutil.which("systemd-run"):
             cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={cap}", "-p", "MemorySwapMax=0"] + cmd
         subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ, PYTHONPATH=ROOT), start_new_session=True, stdin=subprocess.DEVNULL,
@@ -98,6 +104,40 @@ class Session:
                     return pid
             os.kill(pid, signal.SIGKILL)
         return pid
+
+
+def hardware():
+    """what this machine has: CUDA GPUs (via torch, else nvidia-smi), CPU cores, RAM"""
+    hw = {"cuda": False, "gpus": [], "cpus": os.cpu_count(),
+          "ram_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)}
+    try:
+        import torch
+        if torch.cuda.is_available():
+            hw["gpus"] = [{"name": torch.cuda.get_device_name(i), "vram_gb": round(torch.cuda.get_device_properties(i).total_memory / 1e9, 1)}
+                          for i in range(torch.cuda.device_count())]
+    except Exception:  # noqa: BLE001
+        pass
+    if not hw["gpus"] and shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            hw["gpus"] = [{"name": l.split(",")[0].strip(), "vram_gb": round(float(l.split(",")[1]) / 1024, 1)} for l in out.splitlines() if "," in l]
+        except Exception:  # noqa: BLE001
+            pass
+    hw["cuda"] = bool(hw["gpus"])
+    hw["label"] = (" + ".join(f"{g['name']} ({g['vram_gb']:.0f} GB)" for g in hw["gpus"]) if hw["gpus"]
+                   else f"CPU only ({hw['cpus']} cores, {hw['ram_gb']:.0f} GB RAM)")
+    return hw
+
+
+def sizing(hw, small):
+    """parallelism and limits for this machine (re-applied on every start, so a session moved to a GPU box speeds up)"""
+    vram = sum(g["vram_gb"] for g in hw["gpus"])
+    if hw["cuda"] and (small or vram >= 24):
+        return {"device": "cuda", "workers": 8 if small else (4 if vram < 48 else 8), "memory_cap": None}
+    if hw["cuda"]:   # a big model on a small GPU: ollama splits it with system RAM
+        return {"device": "cuda", "workers": 1, "memory_cap": None}
+    return {"device": "cpu", "workers": 1 if small else 2, "memory_cap": "3500M" if small and hw["ram_gb"] < 24 else None}
 
 
 def model_info(tag, host=None):
@@ -146,13 +186,11 @@ def create(folder, model, goal):
         raise ValueError(problem)
     pc = pl["params"].upper()
     small = pc.endswith("M") or (pc.endswith("B") and pc[:-1].replace(".", "", 1).isdigit() and float(pc[:-1]) <= 4)
-    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     cfg = {"model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"], "name": f"s{abs(hash(s.folder)) % 10**6}",
-           "ollama_url": url, "ollama_admin_url": admin, "research": True, "auto": False,
+           "ollama_url": url, "ollama_admin_url": admin, "research": True, "small": small,
            "n_dev_per_family": 3, "n_test_per_family": 5, "n_general": 8, "min_gain": 2, "max_general_loss": 1,
            "num_predict": 3072 if small else 16384, "num_ctx": 6144 if small else 24576, "pilot_num_predict": 3072 if small else 12000,
-           "workers": 1 if small else 4, "memory_cap": "3500M" if small and ram < 24 else None, "pilot_think": True,
-           "created": time.strftime("%Y-%m-%d %H:%M")}
+           "pilot_think": True, "created": time.strftime("%Y-%m-%d %H:%M"), **sizing(hardware(), small)}
     s.write("config.json", cfg)
     return s
 
@@ -194,6 +232,7 @@ class Asker:
 class Loop:
     def __init__(self, folder):
         self.s = Session(folder); self.cfg = self.s.cfg; self.state = self.s.p("state")
+        self.hw = hardware(); self.cfg.update(sizing(self.hw, self.cfg.get("small", True)))   # this machine, this start
         llm.LIVE["dir"] = self.s.p("live")
         self.admin = self.cfg["ollama_admin_url"].split("://")[-1]
         self.master_blob, _ = gguf_io.ollama_show(self.cfg["master_tag"], self.admin)
@@ -205,7 +244,8 @@ class Loop:
 
     # -------- bookkeeping
     def status(self, cycle, step, detail="", **kw):
-        self.s.write("status.json", {"cycle": cycle, "step": step, "detail": detail, "since": time.time(), "generation": self.lineage["current"], **kw})
+        self.s.write("status.json", {"cycle": cycle, "step": step, "detail": detail, "since": time.time(), "generation": self.lineage["current"],
+                                     "device": self.hw["label"], "pid": os.getpid(), **kw})
 
     @property
     def gen(self):
@@ -221,7 +261,7 @@ class Loop:
     def stream(self):
         if self._S is None:
             from .arch_qwen35 import Qwen35Stream
-            self._S = Qwen35Stream(self.master_blob, os.path.join(ROOT, "data", "qwen35_tokenizer.json"), base_dir=self.state)
+            self._S = Qwen35Stream(self.master_blob, os.path.join(ROOT, "data", "qwen35_tokenizer.json"), device=self.cfg["device"], base_dir=self.state)
         return self._S
 
     def materialize(self, specs, tag):
@@ -340,6 +380,7 @@ class Loop:
     def cycle(self, k, direction):
         cfg = self.cfg; t0 = time.time(); gen0 = self.gen
         rec = {"cycle": k, "generation": gen0["gen"], "direction": direction, "started": time.strftime("%H:%M")}
+        dtext = (direction or {}).get("text") if isinstance(direction, dict) else direction
         # 1 observe
         dev = self.fac.sample("dev", k, cfg["n_dev_per_family"])
         self.status(k, "observe", f"solving {len(dev)} fresh practice problems")
@@ -349,7 +390,8 @@ class Loop:
         rec["practice"] = {"n": len(recs), "accuracy": round(float(np.mean([r["correct"] for r in recs])), 3),
                            "unfinished": summ["counts"]["unfinished"], "doubt_after_answer": summ["doubt_events_after_answer"],
                            "doubt_total": summ["doubt_events_total"]}
-        brief = {"goal": cfg["goal"], "human_direction": direction or "(none: your call)", "practice_results": rec["practice"],
+        brief = {"goal": cfg["goal"], "plan_for_this_cycle": dtext or "(none yet: your call)",
+                 "plan_came_from": (direction or {}).get("from", "") if isinstance(direction, dict) else "", "practice_results": rec["practice"],
                  "accuracy_by_problem_type": summ["accuracy_by_suite"], "patterns_by_outcome": summ["detectors_mean_by_outcome"],
                  "failing_traces": detectors.excerpts(recs, D, k=3, width=600),
                  "earlier_cycles": [{"edit": h.get("edit"), "strength": h.get("strength"), "kept": h.get("kept"), "result": h.get("summary")}
@@ -393,6 +435,31 @@ class Loop:
                            f"general {gp['before']:.0%} → {gp['after']:.0%} (+{gp['fixed']}/−{gp['broken']}): {'KEPT' if keep else 'reverted'}")
         return rec
 
+    def plan_next(self, k, rec):
+        """step 5: the model looks at what just happened, proposes plans for the next cycle and picks one"""
+        cfg = self.cfg
+        self.status(k, "plan", "proposing plans for the next cycle and picking one")
+        recent = [{"cycle": h.get("cycle"), "edit": h.get("edit"), "strength": h.get("strength"), "kept": h.get("kept"), "result": h.get("summary")}
+                  for h in self.s.history()[-6:]] + [{"cycle": k, "edit": rec.get("edit"), "strength": rec.get("strength"), "kept": rec.get("kept"),
+                                                     "result": rec.get("summary"), "diagnosis": rec.get("diagnosis"), "why": rec.get("why")}]
+        msgs = [{"role": "system", "content": open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{cfg['goal']}"},
+                {"role": "user", "content": "Cycle results so far (newest last):\n" + json.dumps(recent, indent=1) +
+                 f"\n\nYou are now generation {self.lineage['current']}. Propose 2 to 4 concrete plans for the next cycle (which "
+                 "failure to target, which change from the menu, or what to try differently, and why), then pick the one most likely "
+                 "to make real progress on the goal. Don't repeat a reverted change unless you change something material."}]
+        for _ in range(2):
+            try:
+                r = llm.chat(cfg, self.tag, msgs, think=cfg["pilot_think"], fmt=PLANS, num_predict=cfg["pilot_num_predict"],
+                             live={"slot": "pilot", "title": "planning the next cycle"})
+                d = json.loads(r["message"]["content"])
+                plans = [p for p in d.get("plans", []) if isinstance(p, dict) and p.get("plan")][:4]
+                if plans:
+                    pick = min(max(int(d.get("pick", 0)), 0), len(plans) - 1)
+                    return plans, pick, d.get("reason", "")
+            except Exception:  # noqa: BLE001
+                continue
+        return [{"plan": "re-diagnose the current model and try the change that best fits its most common failure", "why": "fallback"}], 0, "fallback"
+
     def run(self):
         open(self.s.p("loop.pid"), "w").write(str(os.getpid()))
 
@@ -404,25 +471,31 @@ class Loop:
             os._exit(0)
         signal.signal(signal.SIGTERM, term)
         self.setup()
-        k = len(self.s.history()); go = k == 0; direction = None
+        hist = self.s.history(); k = len(hist)
+        direction = None
+        if hist and hist[-1].get("next_plans"):   # resuming: carry on with the plan picked last time
+            last = hist[-1]; direction = {"from": "model", "text": last["next_plans"][last.get("picked", 0)]["plan"]}
         seen = sum(1 for _ in open(self.s.p("inbox.jsonl"))) if os.path.exists(self.s.p("inbox.jsonl")) else 0
         while True:
             lines = open(self.s.p("inbox.jsonl")).read().splitlines() if os.path.exists(self.s.p("inbox.jsonl")) else []
             for l in lines[seen:]:
-                go = True; t = json.loads(l)["text"].strip()
-                direction = t or direction
+                t = json.loads(l)["text"].strip()
+                if t:
+                    direction = {"from": "human", "text": t}   # your direction beats the model's own pick
             seen = len(lines)
-            if not (go or self.cfg.get("auto")):
-                self.status(k, "waiting", "press Enter for the next cycle, or type what it should work on"); time.sleep(1); continue
-            go = False
             try:
                 rec = self.cycle(k, direction)
+                if not rec.get("summary", "").startswith("error"):
+                    plans, pick, reason = self.plan_next(k, rec)
+                    rec.update(next_plans=plans, picked=pick, pick_reason=reason)
+                    direction = {"from": "model", "text": plans[pick]["plan"]}
             except Exception as e:  # noqa: BLE001
                 rec = {"cycle": k, "generation": self.lineage["current"], "kept": False, "summary": f"error: {type(e).__name__}: {e}",
                        "trace": traceback.format_exc()[-2000:]}
+                self.status(k, "error", rec["summary"][:150]); time.sleep(30)
             with open(self.s.p("history.jsonl"), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
-            k += 1; direction = None
+            k += 1
 
 
 if __name__ == "__main__":

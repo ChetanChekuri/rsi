@@ -1,5 +1,5 @@
-"""rsi: one screen. Left: what the model is producing right now (scrolls as it streams). Right: what it is doing and
-every cycle so far. Bottom: press Enter for the next cycle, or type what it should work on.
+"""rsi: one screen. Left: what the model is producing right now (scrolls as it streams). Right: what it is doing, the
+plans it made for the next cycle, and every cycle so far. Bottom: type to steer the next cycle (optional).
 
     rsi            open the loop for this folder (in a new folder: pick a model and a goal first)
     rsi stop       stop this folder's loop
@@ -16,7 +16,7 @@ from textual.widgets import Button, Footer, Input, Label, Select, Static, TextAr
 from .loop import Session, create, models, plan
 
 ACC, WARN, GOOD, BAD, DIM = "#5fd7d7", "#ffd75f", "#87d787", "#ff8787", "grey58"
-STEPS = ["observe", "think", "test", "keep"]
+STEPS = ["observe", "think", "test", "plan"]
 CSS = """
 Screen { background: #1b1e23; }
 #top { height: 3; padding: 0 1; background: #22272e; }
@@ -49,7 +49,7 @@ class New(Screen):
             yield Static(Text(f"new loop in {self.folder}", style=DIM))
             yield Label("Model")
             yield Select([(f"{m['tag']}   ({m['size']})", m["tag"]) for m in ms], prompt="choose a model", id="model")
-            yield Label("What should it get better at?")
+            yield Label("Main prompt: what should it get better at?  (it plans every cycle after this on its own)")
             yield TextArea("", id="goal")
             yield Static("", id="err")
             yield Button("Start", variant="success", id="start")
@@ -101,7 +101,7 @@ class Main(Screen):
     BINDINGS = [("ctrl+q", "app.quit", "quit (the loop keeps running)")]
 
     def __init__(self, folder):
-        super().__init__(); self.s = Session(folder); self.sig = None
+        super().__init__(); self.s = Session(folder); self.sig = None; self.restarted = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(id="top")
@@ -112,26 +112,32 @@ class Main(Screen):
                 yield Static(id="now")
                 with VerticalScroll(id="cycles-box"):
                     yield Static(id="cycles")
-        yield Input(placeholder="Enter = next cycle   ·   or type what it should work on, then Enter", id="prompt")
+        yield Input(placeholder="optional: type a direction for the next cycle (otherwise the model follows its own plan)", id="prompt")
         yield Footer()
 
     def on_mount(self):
-        if not self.s.pid():
-            self.s.start()
+        n = len(self.s.history())
+        if self.s.pid():
+            self.notify(f"reconnected: the loop is running ({n} cycles so far)", timeout=4)
+        else:
+            self.s.start(); self.restarted = time.time()
+            self.notify(f"resumed the loop from cycle {n}" if n else "started the loop", timeout=4)
         self.tick(); self.set_interval(0.5, self.tick)
         self.query_one("#prompt", Input).focus()
 
     def tick(self):
         cfg, st = self.s.cfg, self.s.read("status.json", {}) or {}
         lin = self.s.read("lineage.json", {}) or {}; hist = self.s.history(); running = bool(self.s.pid())
+        if not running and time.time() - self.restarted > 60:   # the loop died (crash, reboot): bring it back, resuming
+            self.s.start(); self.restarted = time.time()
         step = st.get("step", "starting")
         top = Text.assemble((" rsi ", f"bold black on {ACC}"), (f"  {cfg['model']}", "bold"), (f"   generation {lin.get('current', 0)}", ACC),
                             (f"   cycle {st.get('cycle', 0)}", DIM), ("   ", ""),
-                            (f" {'WAITING FOR YOU' if step == 'waiting' else step.upper()} ", f"bold black on {WARN if step == 'waiting' else (BAD if not running else ACC)}"),
-                            ("" if running else "  loop not running (it restarts when you open rsi)", BAD),
+                            (f" {step.upper()} ", f"bold black on {BAD if (not running or step == 'error') else ACC}"),
+                            ("" if running else "  loop not running: restarting", BAD), (f"   {st.get('device', '')}", DIM),
                             (f"\n goal: {cfg['goal'][:150]}", f"italic {WARN}"))
         self.query_one("#top", Static).update(top)
-        self.query_one("#prompt", Input).set_class(step == "waiting", "waiting")
+
         # live pane: re-render when it changed; follow the bottom unless the user scrolled up
         title, body = live_view(self.s.dir)
         box = self.query_one("#live-box", VerticalScroll)
@@ -146,9 +152,9 @@ class Main(Screen):
         # what it is doing now
         line = Text()
         for s_ in STEPS:
-            on_ = s_ == step or (s_ == "keep" and step == "waiting")
+            on_ = s_ == step
             line.append("● " if on_ else "○ ", ACC if on_ else DIM); line.append(s_ + "    ", f"bold {ACC}" if on_ else DIM)
-        now = [line, Text(st.get("detail", ""), style="bold" if step != "waiting" else WARN)]
+        now = [line, Text(st.get("detail", ""), style="bold")]
         if hist:
             h = hist[-1]
             now += [Text(""), Text("last cycle", style=DIM), Text(h.get("summary", ""), style=GOOD if h.get("kept") else BAD)]
@@ -156,14 +162,22 @@ class Main(Screen):
                 now += [Text(f"why it chose that: {h['why']}", style="italic")]
             if h.get("searches"):
                 now += [Text("it searched: " + "; ".join(f"{x['tool']} {json.dumps(x['args'])[:60]}" for x in h["searches"]), style=DIM)]
+            if h.get("next_plans"):
+                now += [Text(""), Text("its plans for the next cycle", style=DIM)]
+                for i, p in enumerate(h["next_plans"]):
+                    chosen = i == h.get("picked", 0)
+                    now += [Text(("▶ " if chosen else "  ") + p["plan"], style=f"bold {ACC}" if chosen else DIM)]
+                if h.get("pick_reason"):
+                    now += [Text(f"picked because: {h['pick_reason']}", style="italic")]
         self.query_one("#now", Static).update(Group(*now))
         # all cycles
         tb = Table(box=None, expand=True, header_style=f"bold {ACC}", pad_edge=False)
-        for c in ("#", "change it chose", "goal before → after", "general", ""):
+        for c in ("#", "plan from", "change it chose", "goal before → after", "general", ""):
             tb.add_column(c)
         for h in reversed(hist):
             t = h.get("test") or {}; g, gg = t.get("goal") or {}, t.get("general") or {}
-            tb.add_row(str(h["cycle"]), f"{h.get('edit', '-')} {h.get('strength', '')}",
+            src = (h.get("direction") or {}).get("from", "goal") if isinstance(h.get("direction"), dict) else ("you" if h.get("direction") else "goal")
+            tb.add_row(str(h["cycle"]), {"human": "you", "model": "itself"}.get(src, src), f"{h.get('edit', '-')} {h.get('strength', '')}",
                        f"{g['before']:.0%} → {g['after']:.0%}" if g.get("before") is not None else "-",
                        f"{gg['before']:.0%} → {gg['after']:.0%}" if gg.get("before") is not None else "-",
                        Text("kept" if h.get("kept") else ("reverted" if g else (h.get("summary") or "")[:30]), style=GOOD if h.get("kept") else BAD))
@@ -172,10 +186,11 @@ class Main(Screen):
 
     @on(Input.Submitted, "#prompt")
     def send(self, ev):
-        self.s.post(ev.value.strip()); ev.input.value = ""
-        if not self.s.pid():
-            self.s.start()
-        self.notify("starting the next cycle" + (f" with your direction" if ev.value.strip() else ""), timeout=3)
+        text = ev.value.strip(); ev.input.value = ""
+        if not text:
+            return
+        self.s.post(text)
+        self.notify("got it: the next cycle will follow your direction instead of the model's own pick", timeout=4)
 
 
 class RSI(App):

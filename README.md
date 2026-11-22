@@ -5,13 +5,25 @@ kept only if the model gets better. The next cycle is then run by the changed mo
 change is a closed-form edit of the weight matrices (a rank-1 projection or a scaling), found and applied in seconds.
 
 ```
-rsi            # in any folder: pick a model and a goal, then watch it work on itself
+rsi            # in any folder: pick a model, type the main prompt (the goal), then watch it work on itself
 ```
 
 ![rsi: the model writing its own practice problems, streamed live](docs/rsi_live.svg)
 
 Each folder is its own loop: everything it does lives in `<folder>/.rsi/`. The loop runs in the background, so
-closing the window (ctrl+q) doesn't stop it; `rsi stop` does.
+closing the window (ctrl+q) doesn't stop it; `rsi stop` does. Run `rsi` in the folder again to reconnect. If the loop
+died (crash, reboot), it resumes at the cycle it was on, reuses every problem it already solved, and carries on
+with the plan it had picked.
+
+## Commands
+
+| | |
+|---|---|
+| `rsi` | in a new folder: choose a model and type the main prompt; in a folder with a loop: reconnect (and resume it if it stopped) |
+| `rsi PATH` | the same for another folder |
+| `rsi stop` / `rsi stop PATH` | stop that folder's loop (it resumes the next time you open it) |
+| type + Enter | optional: a direction for the next cycle, used instead of the model's own pick |
+| ctrl+q | close the window; the loop keeps running |
 
 ## One cycle
 
@@ -30,8 +42,10 @@ closing the window (ctrl+q) doesn't stop it; `rsi stop` does.
 3. **Test.** The change is baked into a copy of the weights. Both versions solve the same fresh held-out problems: new
    problems for the goal, plus general problems (GSM8K, ARC-Challenge) as a forgetting check.
 4. **Keep or revert.** The copy becomes the model only if it solves at least 2 more goal problems than it breaks, and
-   loses at most 1 general problem net. Then the loop waits for you: **press Enter** for the next cycle, or **type
-   what it should work on** and press Enter.
+   loses at most 1 general problem net.
+5. **Plan.** The (possibly new) model looks at every result so far, proposes 2–4 plans for the next cycle, picks
+   one with a reason, and the next cycle starts on it. The main prompt you gave at the start is the only input it
+   needs; if you type a direction, the next cycle follows yours instead of its own pick.
 
 The left pane shows, live, whatever the model is producing: its thinking about itself, or a problem it is solving
 (with the answer key). It scrolls as the text streams.
@@ -58,6 +72,11 @@ The left pane shows, live, whatever the model is producing: its thinking about i
   Rating good reasoning as likely is not the same as producing it, which is why the test step uses real generation.
 
 ## Models and hardware
+
+On every start the loop detects the hardware (CUDA GPUs through torch, else `nvidia-smi`; otherwise CPU cores and
+RAM), shows it in the top bar, and sizes itself: parallel generations, the device for the layer-streaming forward
+pass, and a memory cap on small-RAM CPU machines. A loop moved to a GPU machine speeds up on its next start.
+
 
 The weight editor supports the Qwen3.5 / Qwen3.8 family (ollama architecture `qwen35`), e.g. `qwen3.5:0.8b` and
 `qwen3.8:27b`. Editing needs a Q8_0 (or F16) build; for a Q4 model, `rsi` edits the `-q8_0` tag and derives the Q4
