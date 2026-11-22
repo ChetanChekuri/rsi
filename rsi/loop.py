@@ -237,7 +237,11 @@ class Asker:
 class Loop:
     def __init__(self, folder):
         self.s = Session(folder); self.cfg = self.s.cfg; self.state = self.s.p("state")
-        self.hw = hardware(); self.cfg.update(sizing(self.hw, self.cfg.get("small", True)))   # this machine, this start
+        small = self.cfg.get("small", True)
+        for k, v in {"max_steps": 40, "max_cycle_minutes": 120, "max_run_s": 1800, "sandbox_mem": "4G" if small else "24G",
+                     "sandbox_network": False, "num_ctx": 16384 if small else 32768}.items():
+            self.cfg.setdefault(k, v)   # loops created before these settings existed
+        self.hw = hardware(); self.cfg.update(sizing(self.hw, small))   # this machine, this start
         llm.LIVE["dir"] = self.s.p("live"); os.makedirs(self.s.p("live"), exist_ok=True)
         self.workspace = os.path.join(self.s.folder, "workspace"); os.makedirs(self.workspace, exist_ok=True)
         self.admin = self.cfg["ollama_admin_url"].split("://")[-1]
