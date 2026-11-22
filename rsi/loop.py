@@ -81,9 +81,11 @@ class Session:
         if self.pid():
             return self.pid()
         cmd = [sys.executable, "-u", "-m", "rsi.loop", self.folder]
-        cap = sizing(hardware(), self.cfg.get("small", True))["memory_cap"]   # decided for this machine, now
-        if cap and shutil.which("systemd-run"):
-            cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={cap}", "-p", "MemorySwapMax=0"] + cmd
+        lim = sizing(hardware(), self.cfg.get("small", True))   # decided for this machine, now
+        props = (["-p", f"MemoryMax={lim['memory_cap']}", "-p", "MemorySwapMax=0"] if lim.get("memory_cap") else []) + \
+                (["-p", f"CPUQuota={lim['cpu_quota']}"] if lim.get("cpu_quota") else [])
+        if props and shutil.which("systemd-run"):
+            cmd = ["systemd-run", "--user", "--scope", "-q"] + props + cmd
         subprocess.Popen(cmd, cwd=ROOT, env=dict(os.environ, PYTHONPATH=ROOT), start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=open(self.p("loop.log"), "a"), stderr=subprocess.STDOUT)
         for _ in range(40):
@@ -137,7 +139,9 @@ def sizing(hw, small):
         return {"device": "cuda", "workers": 8 if small else (4 if vram < 48 else 8), "memory_cap": None}
     if hw["cuda"]:   # a big model on a small GPU: ollama splits it with system RAM
         return {"device": "cuda", "workers": 1, "memory_cap": None}
-    return {"device": "cpu", "workers": 1 if small else 2, "memory_cap": "3500M" if small and hw["ram_gb"] < 24 else None}
+    # CPU-only: cap memory on small-RAM machines and use at most half the cores, so a laptop doesn't overheat
+    return {"device": "cpu", "workers": 1 if small else 2, "memory_cap": "3500M" if small and hw["ram_gb"] < 24 else None,
+            "cpu_quota": f"{max(1, (hw['cpus'] or 2) // 2) * 100}%"}
 
 
 def model_info(tag, host=None):
