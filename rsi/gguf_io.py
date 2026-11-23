@@ -1,4 +1,4 @@
-"""GGUF access for qwen35-family models (Qwen3.5 0.8B ... Qwen3.8 27B).
+"""GGUF access for any model ollama runs (validated byte-exact on qwen35: Qwen3.5 0.8B ... Qwen3.8 27B).
 
 - metadata + per-tensor dequantization for any ggml type gguf-py understands (Q8_0, K-quants, F16, BF16, ...)
 - baking a list of edit specs into a copy of the master GGUF *in place* (byte layout unchanged), which requires the
@@ -67,10 +67,10 @@ class GGUF:
 
 
 def writers(g, l):
-    """residual writers of layer l: mixer output (ssm_out or attn_output) and MLP down-projection"""
+    """residual writers of layer l: mixer output (ssm_out or attn_output) and MLP down-projection(s), any architecture"""
     p = f"blk.{l}."
-    mix = p + "ssm_out.weight" if p + "ssm_out.weight" in g.T else p + "attn_output.weight"
-    return [mix, p + "ffn_down.weight"]
+    mix = [p + n for n in ("ssm_out.weight", "attn_output.weight") if p + n in g.T][:1]
+    return mix + [p + n for n in ("ffn_down.weight", "ffn_down_exps.weight", "ffn_down_shexp.weight") if p + n in g.T]
 
 
 def _env(host=None):

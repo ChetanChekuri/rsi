@@ -210,9 +210,16 @@ def n_layers(path=None):
 
 def stream(path=None, device="auto"):
     """a layer-streaming forward pass over a GGUF (activations, log-likelihoods; ~1 GB resident even for 27B).
-    Reference implementation of the architecture: rsi/arch_qwen35.py."""
-    from rsi.arch_qwen35 import Qwen35Stream
-    return Qwen35Stream(path or current_gguf(), info()["tokenizer"], device)
+    Qwen3.5/3.8: rsi/arch_qwen35.py. llama, mistral, qwen2, qwen3, granite...: rsi/arch_generic.py. Anything else:
+    write your own (subclass GenericStream). Verify a stream with check_stream() before trusting it."""
+    from rsi.arch_generic import open_stream
+    return open_stream(path or current_gguf(), device)
+
+
+def check_stream(S=None, model=None):
+    """(agreed, total, details): does the stream predict the same next token as ollama does for this model?"""
+    from rsi.arch_generic import check_stream as chk
+    return chk(S or stream(), model or info()["current_model"])
 
 
 def doubt_direction(records, post_answer=True, path=None):

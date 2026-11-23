@@ -160,18 +160,20 @@ def models(host=None):
 
 
 def plan(tag, host=None):
-    """which GGUF gets edited (needs Q8_0/F16) and which quantization the candidates run at"""
+    """Any model ollama can run. Which GGUF is the editable master (Q8_0/F16/BF16/F32 can be overwritten in place),
+    and which quantization the derived models run at. Quantized-only models still work: write_gguf re-encodes the
+    tensors it changes, and the model can re-quantize or fetch a higher-precision build itself."""
     info = model_info(tag, host)
-    if info.get("architecture") != "qwen35":
-        return None, f"{tag} is {info.get('architecture', '?')}; the weight editor supports the Qwen3.5 / Qwen3.8 family (qwen35)"
-    q = info.get("quantization", "").upper()
+    if not info.get("architecture"):
+        return None, f"ollama doesn't know a model called {tag}"
+    q = info.get("quantization", "").upper(); base = {"params": info.get("parameters", ""), "arch": info["architecture"]}
     if q in ("Q8_0", "F16", "BF16", "F32"):
-        return {"master_tag": tag, "run_quant": None, "params": info.get("parameters", "")}, None
-    base, size = tag.split(":")[0], (tag.split(":")[1].split("-")[0] if ":" in tag else "latest")
-    master = f"{base}:{size}-q8_0"
-    if model_info(master, host).get("architecture") != "qwen35":
-        return None, f"{tag} is {q}; editing needs a Q8_0 build. Pull it first:  ollama pull {master}"
-    return {"master_tag": master, "run_quant": "Q4_K_M" if q.startswith("Q4") else q, "params": info.get("parameters", "")}, None
+        return {"master_tag": tag, "run_quant": None, **base}, None
+    name, size = tag.split(":")[0], (tag.split(":")[1].split("-")[0] if ":" in tag else "latest")
+    for cand in (f"{name}:{size}-q8_0", f"{name}:{size}-fp16", f"{name}:{size}-bf16"):
+        if model_info(cand, host).get("architecture") == info["architecture"]:
+            return {"master_tag": cand, "run_quant": "Q4_K_M" if q.startswith("Q4") else q, **base}, None
+    return {"master_tag": tag, "run_quant": None, **base}, None
 
 
 def create(folder, model, goal):
@@ -184,7 +186,7 @@ def create(folder, model, goal):
         raise ValueError(problem)
     pc = pl["params"].upper()
     small = pc.endswith("M") or (pc.endswith("B") and pc[:-1].replace(".", "", 1).isdigit() and float(pc[:-1]) <= 4)
-    cfg = {**settings.for_new_loop(small), "model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"],
+    cfg = {**settings.for_new_loop(small), "model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"], "arch": pl["arch"],
            "name": f"s{abs(hash(s.folder)) % 10**6}", "small": small, "created": time.strftime("%Y-%m-%d %H:%M")}
     s.write("config.json", cfg)
     return s
@@ -283,7 +285,8 @@ class Loop:
     def write_context(self, k):
         json.dump({"goal": self.cfg["goal"], "cycle": k, "generation": self.lineage["current"], "current_model": self.tag,
                    "current_gguf": self.gguf_of(self.tag), "editable_master_gguf": self.gguf_of(self.cfg["master_tag"]),
-                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json"), "ollama_host": "127.0.0.1:11434",
+                   "arch": self.cfg.get("arch", "qwen35"), "ollama_host": "127.0.0.1:11434",
+                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json") if self.cfg.get("arch", "qwen35") == "qwen35" else None,
                    "device": "cuda" if self.hw["cuda"] else "cpu", "hardware": self.hw["label"],
                    "lineage": self.lineage["generations"]}, open(os.path.join(self.workspace, ".rsi_context.json"), "w"), indent=1)
 
