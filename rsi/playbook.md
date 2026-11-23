@@ -238,6 +238,38 @@ Capabilities (coding, math, knowledge, writing) and the parameters behind them
   71%), but did nothing in chat-style generation, and refitting it on chat-formatted questions made things worse:
   the local signal ignores what later layers do. Judge every candidate by generated answers in the real format. [ours, both]
 
+Reasoning, and gradients as a measuring tool
+- **Writing the steps out is the biggest reasoning lever for a small model.** Tracking values through several
+  steps failed when answering directly and became reliable with steps written out (8-step variable chains 0/8 ->
+  8/8; ordering people from 8 shuffled comparisons 2/8 -> 6/8). [ours, one model; lit agrees]
+- **Some reasoning isn't there to unlock.** Chaining if-then rules with conditions (and distractor rules) stayed at
+  chance with or without written steps: replies stopped without committing, invented premises ("Tom is dry, so
+  Tom must be wet") or reversed rules. Placeholders in format instructions were copied literally ("Answer:
+  <answer>"): give a concrete answer line instead. [ours, one model]
+- **Gradients can measure without training.** Back-propagate one decision token's loss into the activations of
+  the last layers (batched, a few examples at a time; nothing is applied) and read each MLP neuron's gain
+  gradient: activation x (output gradient . its ffn_down column), summed over tokens. [ours]
+- **Plain-loss gradients follow the cheapest route: answer priors and format.** Averaged over examples, they shifted
+  a model from always answering "No" to always answering "Yes", and made it start writing out sums when told to
+  give only the number. Use a margin instead (correct answer vs the opposite answer, or vs the model's own top wrong
+  answer) on balanced examples, so shared prior shifts cancel. [ours]
+- **A diagnostic for missing reasoning.** If the margin gradients of the "yes" cases and the "no" cases point in
+  exactly opposite directions (cosine -1), the model does not tell the cases apart in those layers: the decision is
+  not being computed there, and no edit along the gradient can supply it. [ours, one model]
+- **Skills have a shared direction; knowledge does not.** Averaged gradients of arithmetic answers agreed between
+  random halves of 30 examples (cosine 0.67 and 0.70 on two models); facts and code tokens barely did (0.1-0.2):
+  each fact wants its own change. Only a shared direction can be boosted by one fixed edit. [ours, both for math]
+- **Gradient attribution finds important parts, activation share finds specific ones.** Zeroing the 0.1% of neurons
+  with the largest gradient effect wiped out math but also broke facts and code; zeroing the most capability-
+  specific neurons hurt math alone. The two sets barely overlap. Use the first to find what an output depends on,
+  the second to find what belongs to one capability. [ours]
+- **Margin-gradient gains can beat blind amplification, but not on every model.** Setting ~2,000 late-layer
+  neurons' gains from the averaged math margin gradient lifted generated arithmetic 28 -> 38/60 (+10/-0; the same
+  change on random neurons 28/60; blind amplification 35/60), cost one fact in 32, and did not help multi-step word
+  problems. On a second model the best version gave +4/-1 and stronger versions hurt (+3/-9). [ours, both measured;
+  worked on one] Size edits by the mean gain change (~1-1.5%), not relative to the largest gradient (one outlier
+  neuron then decides the size), and expect an inverted U.
+
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
 S = stream()                                   # verify it with check_stream() first
