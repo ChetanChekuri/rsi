@@ -30,6 +30,9 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
 1. **Decide how to measure the goal.** Write test suites in `tests/<name>/`:
    - `problems.jsonl`, one JSON object per line: `{"id": "...", "prompt": "...", "answer": "..."}`. Generate problems
      with code when you can, so answers are computed rather than guessed. Make them hard enough that you fail some.
+   - for tool calling, a problem can carry `"tools"` (function schemas given to the tested model), `"tool_results"`
+     (`{tool name: canned result}`) and `"messages"` (a multi-turn conversation to continue); grade the calls in
+     `response["tool_calls"]` (each `{name, args, result}`) with a `grade.py`. Include cases where no tool fits.
    - optional `grade.py` with `def grade(problem, response) -> float` (0..1). `response` has `content`, `thinking`,
      `tool_calls`, `done_reason`, `tokens`. Use it for code (run the tests), free-form answers, tool use, length limits.
      Without it, the last `Answer: ...` line is compared with `answer`.

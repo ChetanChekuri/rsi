@@ -2,6 +2,9 @@
 
 A test suite is a folder in the workspace, tests/<name>/ (a single .jsonl file works too):
   problems.jsonl   one problem per line: {"id": ..., "prompt": ..., "answer": ... (optional), any other fields}
+                   Tool-calling problems can add "tools" (function schemas the tested model is given), "tool_results"
+                   ({tool name: canned result}, default {"status": "ok"}) and "messages" (a whole conversation to
+                   continue instead of a single prompt). grade.py then checks response["tool_calls"].
   grade.py         optional: def grade(problem, response) -> float in [0, 1] (or bool). `response` is a dict with
                    "content" (the final reply), "thinking", "tool_calls" ([{name, args, result}]), "done_reason", "tokens".
                    It runs in the sandbox, without internet. Without grade.py, the final answer (the last
@@ -127,8 +130,11 @@ def model_digests(cfg):
 
 def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
     """the tested model answers one problem, with the tools the run settings allow"""
-    tools = ([CODE_TOOL] if opts.get("code") else []) + (WEB_TOOLS if opts.get("internet") else [])
-    msgs = ([{"role": "system", "content": opts["system"]}] if opts.get("system") else []) + [{"role": "user", "content": problem["prompt"]}]
+    own = [t if "function" in t else {"type": "function", "function": t} for t in problem.get("tools") or []]
+    tools = own + ([CODE_TOOL] if opts.get("code") else []) + (WEB_TOOLS if opts.get("internet") else [])
+    own_names = {t["function"]["name"] for t in own}
+    msgs = ([{"role": "system", "content": opts["system"]}] if opts.get("system") else []) + (
+        problem["messages"] if problem.get("messages") else [{"role": "user", "content": problem["prompt"]}])
     calls, tokens, t0, r = [], 0, time.time(), None
     extra = {k: opts[k] for k in ("temperature",) if opts.get(k) is not None}
     for step in range(int(opts.get("max_tool_steps", 6)) + 1):
@@ -154,6 +160,9 @@ def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
                 rc, out = sandbox.run_in_workspace(d, ["python", path], timeout=120, mem="2G", internet=bool(opts.get("internet")),
                                                    ollama_url=cfg["ollama_url"], gate_dir=gate_dir)
                 out = f"[exit {rc}]\n{out.strip()[-4000:]}"
+            elif name in own_names:   # the problem's own tools answer with canned results
+                res = (problem.get("tool_results") or {}).get(name, '{"status": "ok"}')
+                out = res if isinstance(res, str) else json.dumps(res)
             elif name in ("web_search", "fetch_page") and opts.get("internet"):
                 out = research.execute(name, args)[:4000]
             else:
