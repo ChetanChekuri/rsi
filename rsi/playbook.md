@@ -145,6 +145,18 @@ Editing
   vocabulary doesn't find them reliably. Find behaviour directions from activation differences on real traces.
   A cheap first guess with no traces: (mean output-embedding of the behaviour's words − mean of all words) ×
   output-norm weights; it captured part of a traced direction (cosine ~0.25). [ours] Use it to start, not to finish.
+- **To remove a feature, edit where it is read, not only where it is written.** The residual stream accumulates:
+  a direction written by early layers is still there after you strip it from later layers' writers. Removing a
+  direction from every writer in the second half suppressed a behaviour's word by 2.0 nats; projecting it out of the
+  residual (an activation edit) after each of those layers did 5.9, and once after a single layer already matched
+  the whole writer edit. Reader edits recover much of the gap as a plain weight change: for every matrix W that
+  reads the normed residual (gain g), W <- W - a (W (g*r)) (r/g)^T removes what it sees along unit direction r
+  (3.1 nats over the same layers; 4.0 when the output head also ignores r, which needs an untied output.weight,
+  e.g. added with write_gguf). [ours, measured by likelihood at real decision points; the accumulation argument
+  holds for any residual network]
+- **Edits along functional directions survive quantization.** A rank-1 behaviour edit kept its full effect after
+  re-quantizing from 8-bit to 4-bit (-9.9 vs -10.6 nats on the targeted word): quantization noise acts like a random
+  edit, which barely matters. Edit a high-precision master and quantize afterwards. [ours]
 - **Spectral health doesn't detect edits that matter.** The heavy-tail exponent of a matrix's spectrum is a rough
   sign of how trained it is [lit], but useful rank-1 edits leave it unchanged. [ours] It can't replace testing.
 - **Repeating or skipping layers is not free.** Some middle layers can be repeated or removed cheaply, late layers
