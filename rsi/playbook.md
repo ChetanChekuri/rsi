@@ -152,8 +152,11 @@ Editing
   the whole writer edit. Reader edits recover much of the gap as a plain weight change: for every matrix W that
   reads the normed residual (gain g), W <- W - a (W (g*r)) (r/g)^T removes what it sees along unit direction r
   (3.1 nats over the same layers; 4.0 when the output head also ignores r, which needs an untied output.weight,
-  e.g. added with write_gguf). [ours, measured by likelihood at real decision points; the accumulation argument
-  holds for any residual network]
+  e.g. added with write_gguf). But strength costs selectivity: on general text the writer edit added +0.006
+  nats/token, the reader edit +0.031 and the activation edit +0.056, so per unit of collateral damage the writer
+  edit was ~3x more selective (other uses of the direction are also read downstream). Start with writer edits;
+  move to reader edits only when you need a stronger change, and compare candidates at matched effect. [ours,
+  likelihood at real decision points + general loss; the accumulation argument holds for any residual network]
 - **Edits along functional directions survive quantization.** A rank-1 behaviour edit kept its full effect after
   re-quantizing from 8-bit to 4-bit (-9.9 vs -10.6 nats on the targeted word): quantization noise acts like a random
   edit, which barely matters. Edit a high-precision master and quantize afterwards. [ours]
