@@ -151,6 +151,15 @@ Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
   layers 16-23 (8 random tokens: +-0.04). Partial: use it to start a search, then confirm with traces and tests.
 - Spectra don't see edits that matter: v2 (the doubt ablation that doubled accuracy) and v4 changed ffn_down alpha
   by at most 0.02. Spectral health is not a substitute for testing a candidate.
+- Behaviour directions drift with depth: the traced doubt direction agrees with the neighbouring layer's (cosine
+  0.82-0.87) but only 0.59 between layers 16 and 22, and 0.29 between 8 and 22. When editing several layers, take a
+  direction per layer (or per few layers) rather than one direction everywhere.
+- Edit risk is about direction, not size: a random rank-1 change of 5% of ||W|| to ffn_down moved the loss by at most
+  0.002 at any of 10 layers. Block influence predicts what *removing* a layer costs, not what editing it costs
+  (correlation -0.03). An edit that matters is one aligned with something the model uses, so test aligned edits.
+- Repeating a layer is not free depth: on reasoning traces, running layer 10 or 4 twice helped slightly (-0.01
+  nats/token), layer 13 or 17 twice hurt (+0.06), and repeating layers 8-13 together hurt most (+0.12). Late layers
+  can't be repeated (layer 21 twice is worse than skipping it). If you try depth tricks, test one layer at a time.
 
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
