@@ -129,10 +129,19 @@ On every start the loop detects the hardware (CUDA GPUs through torch, else `nvi
 RAM), shows it in the top bar, and sizes itself: parallel test problems, memory and CPU caps, and the device for the
 forward pass.
 
-The weight helpers understand the Qwen3.5 / Qwen3.8 family (ollama architecture `qwen35`), e.g. `qwen3.5:0.8b` and
-`qwen3.8:27b`; with code the model can work on anything it can read. For a Q4 model, `rsi` keeps the `-q8_0` tag as
-an editable master and runs a derived Q4 copy. The 0.8B runs on a laptop CPU; Qwen3.8-27B needs a 24–48 GB GPU and
-plenty of disk (each GGUF-based model it builds is another full copy; `max_models` caps how many it keeps).
+Any model ollama runs can be the starting model. Reading and rewriting tensors, re-quantizing and registering work
+for every architecture. The layer-streaming forward pass (activations, log-likelihoods) covers the Qwen3.5 / Qwen3.8
+family (`qwen35`, its own implementation) and the standard decoder family: llama, mistral, qwen2, qwen3, granite
+and similar (`rsi/arch_generic.py`, tokenizer built from the GGUF itself). `check_stream()` confirms a forward pass
+agrees with ollama's next-token predictions before it is trusted (3/3 on Qwen3.5-0.8B); for other architectures the
+model can subclass it or write its own. For a quantized-only model, `rsi` uses a `-q8_0` / `-fp16` tag as the editable
+master when one exists; otherwise the model works on the quantized file and `write_gguf` re-encodes what it changes.
+The 0.8B runs on a laptop CPU; a 27B model needs a 24-48 GB GPU and plenty of disk (each GGUF-based model it builds
+is another full copy; `max_models` caps how many it keeps).
+
+The playbook also carries what is known about how weights map to behaviour (where outputs form, which layers are
+redundant, attention-sink dimensions, why magnitude isn't importance), measured on Qwen3.5-0.8B with short
+experiments, and a recipe for the model to map its own layers first.
 
 ## Install
 
@@ -154,7 +163,8 @@ rsi/settings.py     rsi settings               rsi/playbook.md  what the model r
 rsi/sandbox.py      where its code runs        rsi/netgate.py   the sandbox's internet proxy and ollama door
 rsi/app.py          the screen                 rsi_lib/         helpers importable in its code
 rsi/jobs.py         background jobs
-rsi/arch_qwen35.py  layer-streaming forward pass over a GGUF (~1 GB resident even for 27B)
+rsi/arch_qwen35.py  layer-streaming forward pass for Qwen3.5/3.8 (~1 GB resident even for 27B)
+rsi/arch_generic.py the same for llama-family models, a GGUF tokenizer, check_stream
 rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions       rsi/detectors.py  failure patterns in a trace
 rsi/research.py     web / arXiv search         rsi/llm.py   talking to ollama (streams live)

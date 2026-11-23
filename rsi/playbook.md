@@ -136,3 +136,30 @@ Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
   behaviour directions instead.
 - Behaviour directions are not in the top singular units of single matrices: ranking SVD units by how much they push
   "Wait/Hmm/Actually" found only noise (best z = 1.8). Find directions from traces (activation differences).
+- The one massive activation is an attention-sink marker: residual dim 119 is about -4 on the *first token* of every
+  text (-4.0, -4.2, -3.5 on three unrelated texts) and ~0 elsewhere. Removing it after layer 6 costs +8% loss and
+  flipping its sign +19%. Treat whatever writes it as untouchable.
+- Size is not importance: dims 0 and 46 are the largest residual dims at almost every layer, yet setting them to a
+  constant, or zeroing them, at layer 12 changes nothing (loss 1.673 -> 1.665-1.674). Rank parts by what removing
+  them does, not by magnitude.
+- A behaviour becomes "words" only late: the traced doubt direction, read through the vocabulary, barely favours
+  "Wait/Hmm/But" up to layer 8 (z 0-1), somewhat at 11-15 (z 2-3.6) and strongly from layer 16 on (z ~5). So edits
+  meant to change what the model *says* belong in the last third of the layers; earlier layers hold the
+  abstract version of the behaviour.
+- A cheap first guess for a behaviour direction needs no traces: (mean output-embedding of the target words - mean
+  of all words) x output-norm weights. For doubt words it matched the traced direction with cosine 0.23-0.27 in
+  layers 16-23 (8 random tokens: +-0.04). Partial: use it to start a search, then confirm with traces and tests.
+- Spectra don't see edits that matter: v2 (the doubt ablation that doubled accuracy) and v4 changed ffn_down alpha
+  by at most 0.02. Spectral health is not a substitute for testing a candidate.
+
+How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
+```python
+S = stream()                                   # verify it with check_stream() first
+seqs = [S.enc(t) for t in some_texts]
+acts = S.run(seqs, capture=[{"pos": list(range(len(s)))} for s in seqs])[0]["pos"]   # {layer: (tokens, D)}
+# block influence of layer l: 1 - mean cosine(acts[l-1], acts[l]); low = redundant, safe to edit or skip
+# massive dims: |acts[l]| hundreds of times the median, usually on the first token: don't touch their writers
+# logit lens: apply output_norm + LM head to acts[l]; the layer where it starts matching the final prediction is
+#   where the output takes shape; behaviour edits act from there on
+# test a hypothesis by changing one thing in S.block (zero a dim, skip a layer) and comparing S.run(..., score=nll)
+```
