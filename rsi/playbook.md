@@ -112,3 +112,27 @@ Matrices that write into the residual stream are each layer's `ssm_out`/`attn_ou
   on 60 more (+23/−0). Accuracy on problems both versions finished was the same: the gain was finishing.
 - Amplifying a direction toward concise reference reasoning made the model *rate* good reasoning as more likely but
   *produce* worse reasoning.
+
+## How weights map to behaviour (measured; use it to choose where to edit)
+
+General findings (research literature):
+- Many LLMs (Llama, Mistral) have a few "super weights" in an early MLP down-projection that create giant,
+  input-independent "massive activations" (they act as biases and attention sinks). Zeroing one such scalar can
+  destroy the model. Before editing early `ffn_down` rows of a new model, look for residual dimensions with values
+  hundreds of times the median and leave the weights that write them alone.
+- Middle-to-late layers are often redundant: their output is nearly their input (cosine > 0.95). They are the
+  cheapest place for an edit and the first candidates for skipping or pruning. The first and last layers matter most.
+- A weight matrix's singular-value spectrum hints at how trained it is (heavy-tail exponent alpha ~2-4 well trained,
+  > 6 close to random). Post-training mostly rotates singular vectors and rescales singular values.
+
+Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
+- No super weight and almost no massive activation (one dim at layer 6, 111x the median, vs thousands in Llama):
+  its gated attention seems to remove them, so single-weight edits are not catastrophic here.
+- Block influence (1 - cos(in, out)): layer 0 0.90, layers 1-6 0.14-0.22, layers 8-13 and 16-22 only 0.04-0.07,
+  last layer 0.40. Skipping layer 21 entirely costs +0.09 nats/token; skipping layer 2 costs +0.77.
+- Spectra: MLP layers 6-14 look the most trained (alpha 4-5); the first and last MLPs look close to random (6-9).
+- The logit lens is unreadable before layer 18 and still mostly wrong at layer 22: the last layer writes the answer.
+  So per-layer "predict the next token" targets are noise in middle layers; edit the late layers through
+  behaviour directions instead.
+- Behaviour directions are not in the top singular units of single matrices: ranking SVD units by how much they push
+  "Wait/Hmm/Actually" found only noise (best z = 1.8). Find directions from traces (activation differences).
