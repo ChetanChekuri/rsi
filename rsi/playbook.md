@@ -157,6 +157,11 @@ Editing
   edit was ~3x more selective (other uses of the direction are also read downstream). Start with writer edits;
   move to reader edits only when you need a stronger change, and compare candidates at matched effect. [ours,
   likelihood at real decision points + general loss; the accumulation argument holds for any residual network]
+- **Edit just after a behaviour becomes word-shaped; use the last layer only for strength.** One-layer writer edits
+  (each layer's own direction): before the behaviour is readable through the vocabulary, nothing happens; in the
+  layers just after it becomes readable, the behaviour drops and general loss *improves slightly*; the final layer
+  gives the largest drop but is the least selective, because it writes the output directly. Find the layer where the
+  logit lens first sees the behaviour, and start editing there. [ours]
 - **Edits along functional directions survive quantization.** A rank-1 behaviour edit kept its full effect after
   re-quantizing from 8-bit to 4-bit (-9.9 vs -10.6 nats on the targeted word): quantization noise acts like a random
   edit, which barely matters. Edit a high-precision master and quantize afterwards. [ours]
