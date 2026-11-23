@@ -1,0 +1,3 @@
+#!/bin/sh
+# pip for the rsi sandbox: installs go to $PIP_TARGET in the workspace (the environment itself is read-only)
+exec /usr/bin/python3 -m pip "$@"

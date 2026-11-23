@@ -1,27 +1,23 @@
-"""The RSI loop. You give one main prompt (the goal). Then, every cycle:
+"""The RSI loop. You give one main prompt (the goal); after that the model runs itself, one cycle after another, in a
+single conversation that carries across cycles (and across models, when it switches to a new version of itself).
 
-  1 practice  the current model solves fresh problems for the goal; the loop counts where it goes wrong
-  2 work      the model works on itself with tools: it runs any code in its sandboxed workspace, reads its own
-              weights, searches the web, builds new models (GGUF files), registers them with ollama, tests them on
-              practice problems, deletes the ones it doesn't need, and may submit one as its successor
-  3 test      a submitted model is tested against the current one on fresh held-out problems (goal + general); it
-              becomes the new current model only if it is better without getting worse at general problems
-  4 plan      the model ends the cycle with a summary and plans for the next one, and picks one
+In a cycle the model decides everything: it writes tests for the goal (problems + a grader) and picks how they run
+(thinking, token budget, whether the tested model gets internet or code), tests itself, researches, changes itself
+any way it can with code (weights, quantization, adapters, Modelfile parameters, training), registers the results
+with ollama, tests them against itself, and either switches to a better one (the conversation moves into it) or
+stays. It ends the cycle with plans for the next one and picks one.
 
-Anything you type reaches the model during the cycle, and overrides its pick for the next one.
-Everything lives in <folder>/.rsi/ (state) and <folder>/workspace/ (the model's sandbox).
+Anything you type reaches the model at its next step, and overrides its pick for the next cycle.
+State lives in <folder>/.rsi/, the model's files in <folder>/workspace/. Settings: `rsi settings`.
 """
-import json, math, os, shutil, signal, subprocess, sys, time, traceback
-import numpy as np
-from . import llm, detectors, gguf_io, research
-from .factory import Factory, BUILTIN, design
-from .probes import general_pool
+import json, os, shutil, signal, subprocess, sys, time, traceback
+from . import llm, gguf_io, settings, tests
+from .tools import Toolbox, tool_list, ACTIVITY
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLAYBOOK = os.path.join(ROOT, "rsi", "playbook.md")
-PLANS = {"type": "object", "properties": {"plans": {"type": "array", "items": {"type": "string"}}, "pick": {"type": "integer"},
-                                          "reason": {"type": "string"}}, "required": ["plans", "pick", "reason"]}
-
+PLANS = {"type": "object", "properties": {"summary": {"type": "string"}, "plans": {"type": "array", "items": {"type": "string"}},
+                                          "pick": {"type": "integer"}, "reason": {"type": "string"}}, "required": ["summary", "plans", "pick", "reason"]}
 
 
 # ------------------------------------------------------------------------------------------------ session (a folder)
@@ -181,75 +177,36 @@ def create(folder, model, goal):
     s = Session(folder)
     for d in ("state", "live"):
         os.makedirs(s.p(d), exist_ok=True)
-    url = os.environ.get("RSI_OLLAMA_URL", "http://127.0.0.1:11434")
-    admin = os.environ.get("RSI_OLLAMA_ADMIN_URL", url)
+    admin = settings.for_new_loop(True)["ollama_admin_url"]
     pl, problem = plan(model, admin.split("://")[-1])
     if problem:
         raise ValueError(problem)
     pc = pl["params"].upper()
     small = pc.endswith("M") or (pc.endswith("B") and pc[:-1].replace(".", "", 1).isdigit() and float(pc[:-1]) <= 4)
-    cfg = {"model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"], "name": f"s{abs(hash(s.folder)) % 10**6}",
-           "ollama_url": url, "ollama_admin_url": admin, "research": True, "small": small,
-           "n_dev_per_family": 3, "n_test_per_family": 5, "n_general": 8, "min_gain": 2, "max_general_loss": 1,
-           "num_predict": 3072 if small else 16384, "num_ctx": 16384 if small else 32768, "pilot_num_predict": 4096 if small else 12000,
-           "max_steps": 40, "max_cycle_minutes": 120, "max_run_s": 1800, "sandbox_mem": "4G" if small else "24G", "sandbox_network": False,
-           "pilot_think": True, "created": time.strftime("%Y-%m-%d %H:%M"), **sizing(hardware(), small)}
+    cfg = {**settings.for_new_loop(small), "model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"],
+           "name": f"s{abs(hash(s.folder)) % 10**6}", "small": small, "created": time.strftime("%Y-%m-%d %H:%M")}
     s.write("config.json", cfg)
     return s
 
 
 # ------------------------------------------------------------------------------------------------ the loop
-def sign_p(w, l):
-    n = w + l
-    return 1.0 if n == 0 else min(1.0, 2 * sum(math.comb(n, i) for i in range(min(w, l) + 1)) / 2 ** n)
-
-
-def compare(a, b, ids):
-    A = {r["id"]: r for r in a}; B = {r["id"]: r for r in b}; ids = [i for i in ids if i in A and i in B]
-    fixed = sum(B[i]["correct"] and not A[i]["correct"] for i in ids); broken = sum(A[i]["correct"] and not B[i]["correct"] for i in ids)
-    fin = lambda R: round(float(np.mean([R[i]["done_reason"] != "length" for i in ids])), 2) if ids else None
-    return {"n": len(ids), "before": round(float(np.mean([A[i]["correct"] for i in ids])), 3) if ids else None,
-            "after": round(float(np.mean([B[i]["correct"] for i in ids])), 3) if ids else None, "fixed": fixed, "broken": broken,
-            "p": round(sign_p(fixed, broken), 3), "finished_before": fin(A), "finished_after": fin(B)}
-
-
-class Asker:
-    """lets the factory ask the model for structured answers (problem generators, reviews)"""
-    def __init__(self, loop):
-        self.loop = loop
-
-    def ask(self, phase, brief, schema, check=None):
-        cfg = self.loop.cfg
-        msgs = [{"role": "system", "content": open(PLAYBOOK).read()},
-                {"role": "user", "content": f"{phase}\n\n{json.dumps(brief, indent=1)}\n\nAnswer with JSON matching: {json.dumps(schema)}"}]
-        for _ in range(2):
-            r = llm.chat(cfg, self.loop.tag, msgs, think=cfg["pilot_think"], fmt=schema, num_predict=cfg["pilot_num_predict"],
-                         live={"slot": "pilot", "title": f"writing practice problems for the goal ({phase.lower()})"})
-            try:
-                return json.loads(r["message"]["content"]), r["message"].get("thinking", "")
-            except ValueError:
-                msgs += [{"role": "assistant", "content": r["message"]["content"]}, {"role": "user", "content": "That was not valid JSON. Try again."}]
-        raise ValueError("no valid JSON")
-
-
-
-
 class Loop:
     def __init__(self, folder):
-        self.s = Session(folder); self.cfg = self.s.cfg; self.state = self.s.p("state")
-        small = self.cfg.get("small", True)
-        for k, v in {"max_steps": 40, "max_cycle_minutes": 120, "max_run_s": 1800, "sandbox_mem": "4G" if small else "24G",
-                     "sandbox_network": False, "num_ctx": 16384 if small else 32768}.items():
-            self.cfg.setdefault(k, v)   # loops created before these settings existed
-        self.hw = hardware(); self.cfg.update(sizing(self.hw, small))   # this machine, this start
+        self.s = Session(folder); self.state = self.s.p("state"); os.makedirs(self.state, exist_ok=True)
+        self.hw = hardware(); self.sz = sizing(self.hw, self.s.cfg.get("small", True))   # this machine, this start
+        self.reload()
         llm.LIVE["dir"] = self.s.p("live"); os.makedirs(self.s.p("live"), exist_ok=True)
         self.workspace = os.path.join(self.s.folder, "workspace"); os.makedirs(self.workspace, exist_ok=True)
-        self.admin = self.cfg["ollama_admin_url"].split("://")[-1]
-        self.fac = Factory(self.state)
-        self.ref = [json.loads(l) for l in open(os.path.join(ROOT, "data", "reference_traces.jsonl"))]
-        self.general = general_pool(exclude={r["id"] for r in self.ref})
+        self.gate_dir = self.s.p("net")
         self.lineage = self.s.read("lineage.json") or {"generations": [], "current": None}
-        self.transcript = []
+        self.chat = self.s.read("state/chat.json", []) or []
+        self.transcript = (self.s.read("live/transcript.json", {}) or {}).get("entries", [])
+        self.cycle_k = 0; self.probation = None
+
+    def reload(self):
+        """settings are re-read at every step, so `rsi settings` changes apply to a running loop"""
+        self.cfg = settings.effective(self.s.cfg, self.sz)
+        self.admin = self.cfg["ollama_admin_url"].split("://")[-1]
 
     # -------- bookkeeping
     def status(self, cycle, step, detail="", **kw):
@@ -257,14 +214,24 @@ class Loop:
                                      "model": self.tag if self.lineage["generations"] else self.cfg["master_tag"],
                                      "device": self.hw["label"], "pid": os.getpid(), **kw})
 
+    def status_activity(self, activity, detail=""):
+        self.status(self.cycle_k, activity, detail)
+
     def note(self, kind, text):
-        """the agent transcript the app shows: model messages, tool calls, tool results, your messages"""
-        self.transcript.append({"t": time.strftime("%H:%M:%S"), "kind": kind, "text": str(text)[:4000]})
-        self.transcript = self.transcript[-120:]
+        """the transcript the app shows: model messages, tool calls, tool results, your messages"""
+        self.transcript.append({"t": time.strftime("%H:%M:%S"), "kind": kind, "text": str(text)[:4000], "cycle": self.cycle_k})
+        self.transcript = self.transcript[-150:]
         try:
             self.s.write("live/transcript.json", {"cycle": self.cycle_k, "entries": self.transcript})
         except Exception:  # noqa: BLE001
             pass
+
+    def record_test(self, k, summ):
+        runs = self.s.read("state/test_runs.json", []) or []
+        runs.append({"cycle": k, **{x: summ[x] for x in ("run_id", "suite", "n", "baseline", "models", "at")},
+                     "settings": {x: summ["settings"].get(x) for x in ("think", "num_predict", "internet", "code")}})
+        self.s.write("state/test_runs.json", runs[-300:])
+        self.note("result", "test " + summ["suite"] + ": " + ", ".join(f"{m.split(':')[-1]} {r['score']:.0%}" for m, r in summ["models"].items()))
 
     @property
     def gen(self):
@@ -282,160 +249,188 @@ class Loop:
         self.lineage["generations"].append({"gen": n, "tag": tag, "note": note, "at": time.strftime("%Y-%m-%d %H:%M")})
         self.lineage["current"] = n; self.s.write("lineage.json", self.lineage)
 
+    def switch(self, tag, reason, k):
+        prev = self.lineage["current"]
+        self.add_generation(tag, f"cycle {k}: {reason}"[:300])
+        self.probation = {"prev": prev, "replies": 0}
+        self.note("note", f"switched to {tag}: {reason}")
+        self.write_context(k)
+
+    def revert(self, why):
+        """the new model couldn't carry on the work: go back to the one before it"""
+        bad = self.gen; prev = self.probation["prev"] if self.probation else 0
+        bad["reverted"] = why
+        self.lineage["current"] = prev; self.s.write("lineage.json", self.lineage); self.probation = None
+        self.note("note", f"switched back to {self.tag}: {bad['tag']} {why}")
+        self.chat.append({"role": "user", "content": f"[loop] Your switch to {bad['tag']} was undone because it {why}. You are "
+                                                     f"{self.tag} again. Note this and carry on."})
+        self.write_context(self.cycle_k)
+
     def setup(self):
         if not self.lineage["generations"]:
             self.status(0, "setup", "preparing generation 0")
             tag = self.cfg["master_tag"]
-            if self.cfg.get("run_quant"):   # big models: run a quantized copy, edit the Q8_0 master
+            if self.cfg.get("run_quant"):   # big models: run a quantized copy, keep the Q8_0 master for editing
                 build = os.path.join(self.state, "build"); os.makedirs(build, exist_ok=True)
                 out = os.path.join(build, "g0.gguf"); gguf_io.derive_run_quant(self.gguf_of(tag), out, self.cfg["run_quant"])
                 tag = f"rsi-{self.cfg['name']}:g0"; gguf_io.register(tag, out, self.cfg["master_tag"], self.admin)
                 shutil.rmtree(build, ignore_errors=True)
             self.add_generation(tag, "the model as downloaded")
-        if not self.fac.meta:
-            self.status(0, "setup", "the model is writing practice-problem generators for the goal")
-            kept = []
-            try:
-                kept = design(Asker(self), self.fac, self.cfg["goal"], 4, frozen=True, origin="gen0")
-            except Exception:  # noqa: BLE001
-                pass
-            if len(kept) < 2:   # never stall: fall back to the built-in generators
-                for n, (sk, code) in BUILTIN.items():
-                    if n not in self.fac.meta:
-                        self.fac.add(n, sk, code, frozen=True, origin="built-in")
+        tests.write_library(self.workspace)
 
-    def write_context(self, k, practice_file):
+    def write_context(self, k):
         json.dump({"goal": self.cfg["goal"], "cycle": k, "generation": self.lineage["current"], "current_model": self.tag,
                    "current_gguf": self.gguf_of(self.tag), "editable_master_gguf": self.gguf_of(self.cfg["master_tag"]),
-                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json"), "latest_practice_traces": practice_file,
+                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json"), "ollama_host": "127.0.0.1:11434",
                    "device": "cuda" if self.hw["cuda"] else "cpu", "hardware": self.hw["label"],
                    "lineage": self.lineage["generations"]}, open(os.path.join(self.workspace, ".rsi_context.json"), "w"), indent=1)
 
-    # -------- the judge: only this decides whether a model replaces the current one
-    def held_out_test(self, k, cand):
-        cfg = self.cfg
-        n0 = cfg["n_general"]; start = (k * n0 + self.fac.secret) % max(1, len(self.general) - n0)
-        focus = self.fac.sample("heldout", k, cfg["n_test_per_family"]); general = self.general[start:start + n0]
-        self.status(k, "test", f"held-out test: current model on {len(focus) + len(general)} fresh problems")
-        a = llm.solve(cfg, self.tag, focus + general, os.path.join(self.state, "tests", f"c{k}-current.jsonl"), who="held-out test, current model")
-        self.status(k, "test", f"held-out test: {cand} on the same problems")
-        b = llm.solve(cfg, cand, focus + general, os.path.join(self.state, "tests", f"c{k}-candidate.jsonl"), who=f"held-out test, {cand}")
-        fp = compare(a, b, [it["id"] for it in focus]); gp = compare(a, b, [it["id"] for it in general])
-        keep = fp["fixed"] - fp["broken"] >= cfg["min_gain"] and gp["broken"] - gp["fixed"] <= cfg["max_general_loss"]
-        verdict = (f"goal {fp['before']:.0%} → {fp['after']:.0%} (+{fp['fixed']}/−{fp['broken']}), general {gp['before']:.0%} → "
-                   f"{gp['after']:.0%} (+{gp['fixed']}/−{gp['broken']}): " + ("KEPT, it is now the current model" if keep else
-                   f"not kept (needs +{cfg['min_gain']} net on the goal and at most −{cfg['max_general_loss']} net on general problems)"))
-        if keep:
-            self.add_generation(cand, f"cycle {k}")
-        self.note("result", "held-out test: " + verdict)
-        return {"kept": keep, "goal": fp, "general": gp, "verdict": verdict}
+    def system_prompt(self):
+        c = self.cfg
+        walls = ("isolated sandbox (only the workspace is writable, your home is hidden)" if c.get("sandbox_isolate", True)
+                 else "no sandbox (your code runs as the user)")
+        net = ("internet on" if c.get("sandbox_internet", True) else "internet off") + (", local network on" if c.get("sandbox_local") else "")
+        lim = [f"{c['max_steps']} tool calls" if c.get("max_steps") else None,
+               f"{c['max_cycle_minutes']} minutes" if c.get("max_cycle_minutes") else None]
+        return (open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{c['goal']}\n\n# Where you are now\n\n"
+                f"- You are `{self.tag}` (generation {self.lineage['current']}; base model `{c['model']}`).\n"
+                f"- Your weights: `{self.gguf_of(self.tag)}` (read-only). Editable master: `{self.gguf_of(c['master_tag'])}`.\n"
+                f"- Hardware: {self.hw['label']}. Code runs in {walls}, {net}"
+                + (f", memory cap {c['sandbox_mem']}" if c.get("sandbox_mem") else "") + ".\n"
+                f"- Budget per cycle: {', '.join(x for x in lim if x) or 'no limit'}. Models you may keep at once: {c.get('max_models') or 'no limit'}.\n"
+                f"- Test defaults: thinking {settings.think(c.get('test_think', 'on'))}, {c.get('test_num_predict')} tokens per reply.\n")
 
-    # -------- one cycle: practice, then the model works on itself with tools
+    def _inbox(self):
+        p = self.s.p("inbox.jsonl")
+        return [json.loads(l)["text"].strip() for l in open(p).read().splitlines() if l.strip()] if os.path.exists(p) else []
+
+    def _trim(self, msgs):
+        """fit the conversation in the context window: shorten old tool results, then drop the oldest turns"""
+        budget = int(self.cfg["num_ctx"]) * 3
+        msgs = [dict(m) for m in msgs]
+        size = lambda ms: sum(len(str(m.get("content", ""))) + len(json.dumps(m.get("tool_calls", ""))) for m in ms)
+        for m in msgs[:-8]:
+            if size(msgs) <= budget:
+                return msgs
+            if m["role"] == "tool" and len(m["content"]) > 600:
+                m["content"] = m["content"][:300] + " …[shortened]… " + m["content"][-200:]
+        if size(msgs) <= budget:
+            return msgs
+        head, rest = msgs[:1], msgs[1:]
+        while rest and size(head + rest) > budget * 0.85:
+            rest = rest[1:]
+            while rest and rest[0]["role"] != "user":
+                rest = rest[1:]
+        hist = self.s.history()[-8:]
+        note = {"role": "user", "content": "[loop] Older turns were removed to fit your context window. Earlier cycles: " +
+                json.dumps([{"cycle": h.get("cycle"), "model_after": h.get("model_after"), "summary": (h.get("summary") or "")[:400]} for h in hist])}
+        return head + [note] + rest
+
+    def _save_chat(self):
+        self.chat = self.chat[-1500:]
+        self.s.write("state/chat.json", self.chat)
+
+    # -------- one cycle: the model works with its tools until it calls finish
     def cycle(self, k, direction):
-        from .tools import TOOLS, Toolbox
-        cfg = self.cfg; t0 = time.time(); self.cycle_k = k; self.transcript = []
-        rec = {"cycle": k, "generation": self.lineage["current"], "model": self.tag, "direction": direction, "started": time.strftime("%H:%M")}
-        # 1 practice (the loop does this, so every cycle starts from fresh evidence)
-        dev = self.fac.sample("dev", k * 100, self.cfg["n_dev_per_family"])
-        self.status(k, "practice", f"solving {len(dev)} fresh practice problems")
-        pfile = os.path.join(self.workspace, "practice", f"current-c{k}.jsonl")
-        recs = llm.solve(cfg, self.tag, dev, pfile, who="practice")
-        summ, D = detectors.summarize(recs); self.fac.update_levels(recs)
-        rec["practice"] = {"accuracy": round(float(np.mean([r["correct"] for r in recs])), 3), "n": len(recs),
-                           "unfinished": summ["counts"]["unfinished"], "doubt_after_answer": summ["doubt_events_after_answer"]}
-        self.write_context(k, os.path.relpath(pfile, self.workspace))
-        # 2 work: a free tool-using episode
+        t0 = time.time(); self.cycle_k = k
         tb = Toolbox(self, k)
-        brief = {"goal": cfg["goal"], "cycle": k, "you_are": f"{self.tag} (generation {self.lineage['current']})",
-                 "plan_for_this_cycle": (direction or {}).get("text") or "(your call)", "plan_came_from": (direction or {}).get("from", ""),
-                 "practice_just_now": rec["practice"], "accuracy_by_problem_type": summ["accuracy_by_suite"],
-                 "failure_patterns_by_outcome": summ["detectors_mean_by_outcome"], "failing_excerpts": detectors.excerpts(recs, D, k=2, width=500),
-                 "practice_traces_file": os.path.relpath(pfile, self.workspace),
-                 "earlier_cycles": [{"cycle": h.get("cycle"), "summary": h.get("summary"), "submitted": (h.get("submitted") or {}).get("model"),
-                                     "verdict": (h.get("submitted") or {}).get("verdict")} for h in self.s.history()[-6:]],
-                 "your_models": tb._owned(), "workspace_files": tb.t_list_files()[:3000],
-                 "budget": f"up to {cfg['max_steps']} tool calls and about {cfg['max_cycle_minutes']} minutes this cycle"}
-        msgs = [{"role": "system", "content": open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{cfg['goal']}"},
-                {"role": "user", "content": "A new cycle. Here is where you stand:\n\n" + json.dumps(brief, indent=1, default=str)}]
-        self.status(k, "work", "working on itself"); self.note("note", f"cycle {k} begins; practice accuracy {rec['practice']['accuracy']:.0%}")
-        seen = len(self._inbox()); nudges = late = 0
-        for step in range(cfg["max_steps"]):
-            if time.time() - t0 > cfg["max_cycle_minutes"] * 60:
-                if late > 2:
+        rec = {"cycle": k, "generation": self.lineage["current"], "model": self.tag, "direction": direction, "started": time.strftime("%H:%M")}
+        self.write_context(k)
+        hist = self.s.history()
+        opening = (f"Cycle {k} begins." + (f" Goal for this cycle ({'from the human' if (direction or {}).get('from') == 'human' else 'your own pick'}): "
+                                          f"{direction['text']}" if direction else " This is the first cycle.") +
+                   f"\nMain goal: {self.cfg['goal']}\n")
+        if not hist:
+            opening += ("\nStart by deciding how to measure progress on the goal: write test suites in tests/ (see the playbook), "
+                        "run them on yourself, and read what goes wrong. Ready-made suites are in tests/library/.\n")
+        opening += "\nWorkspace:\n" + tb.t_list_files()[:3000]
+        self.chat.append({"role": "user", "content": opening}); self._save_chat()
+        self.note("note", f"cycle {k} begins" + (f": {direction['text']}" if direction else ""))
+        seen = len(self._inbox()); quiet = late = 0; step = 0
+        while True:
+            self.reload(); c = self.cfg
+            if (c.get("max_steps") and step >= int(c["max_steps"])) or (c.get("max_cycle_minutes") and time.time() - t0 > int(c["max_cycle_minutes"]) * 60):
+                if late >= 2:
                     break
-                late += 1; msgs.append({"role": "user", "content": "Time is up for this cycle: call finish now."})
-            for t in self._inbox()[seen:]:   # you can talk to it while it works
+                late += 1; self.chat.append({"role": "user", "content": "[loop] This cycle's budget is used up: call finish now."})
+            box = self._inbox()
+            for t in box[seen:]:
                 if t:
-                    msgs.append({"role": "user", "content": f"Message from the human: {t}"}); self.note("human", t)
-            seen = len(self._inbox())
-            r = llm.chat(cfg, self.tag, self._trim(msgs), think=cfg["pilot_think"], tools=TOOLS, num_predict=cfg["pilot_num_predict"],
-                         live={"slot": "pilot", "title": f"working on itself (step {step + 1})"})
-            m = r["message"]; calls = m.get("tool_calls") or []
-            msgs.append({"role": "assistant", "content": m.get("content", ""), **({"tool_calls": calls} if calls else {})})
-            if m.get("content", "").strip():
-                self.note("model", m["content"])
+                    self.chat.append({"role": "user", "content": f"Message from the human: {t}"}); self.note("human", t)
+            seen = len(box)
+            if step and step % 60 == 0 and not c.get("max_steps"):
+                self.chat.append({"role": "user", "content": f"[loop] {step} tool calls so far this cycle. When you have tested and decided, call finish."})
+            step += 1
+            self.status(k, "thinking", f"step {step}")
+            try:
+                r = llm.chat(c, self.tag, [{"role": "system", "content": self.system_prompt()}] + self._trim(self.chat),
+                             think=settings.think(c.get("pilot_think", "on")), tools=tool_list(c), num_predict=c["pilot_num_predict"],
+                             options={"temperature": c["pilot_temperature"]} if c.get("pilot_temperature") is not None else None,
+                             live={"slot": "pilot", "title": f"{self.tag.split(':')[-1]}: cycle {k}, step {step}"})
+            except Exception as e:  # noqa: BLE001
+                if self.probation:
+                    self.revert(f"failed to run ({type(e).__name__}: {str(e)[:150]})"); continue
+                raise
+            m = r["message"]; calls = m.get("tool_calls") or []; content = (m.get("content") or "").strip()
+            if self.probation:
+                self.probation["replies"] += 1
+                if not calls and not content:
+                    self.revert("gave an empty reply"); continue
+                if calls or self.probation["replies"] >= 3:
+                    self.probation = None   # it can work: the switch stands
+            self.chat.append({"role": "assistant", "content": m.get("content", ""), **({"tool_calls": calls} if calls else {})})
+            if content:
+                self.note("model", content)
             if not calls:
-                nudges += 1
-                if nudges > 2:
+                quiet += 1
+                if quiet >= 3:
                     break
-                msgs.append({"role": "user", "content": "Use your tools to make progress on the goal. When you are done, call finish."}); continue
-            for c in calls[:3]:
-                fn = c.get("function", {}); args = fn.get("arguments") or {}
+                self.chat.append({"role": "user", "content": "[loop] Use your tools to make progress. When you are done with this cycle, call finish."})
+                self._save_chat(); continue
+            quiet = 0
+            for call in calls[:4]:
+                fn = call.get("function", {}); args = fn.get("arguments") or {}
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
                     except ValueError:
                         args = {}
-                self.note("call", f"{fn.get('name')}({json.dumps(args)[:1500]})")
-                self.status(k, "work", f"{fn.get('name')} …")
-                out = tb.call(fn.get("name", ""), args if isinstance(args, dict) else {})
+                name = fn.get("name", "")
+                self.note("call", f"{name}({json.dumps(args)[:1500]})")
+                self.status(k, ACTIVITY.get(name, "code"), f"{name} …")
+                out = tb.call(name, args if isinstance(args, dict) else {})
                 self.note("result", out[:3000])
-                msgs.append({"role": "tool", "content": out, "tool_name": fn.get("name", "")})
+                self.chat.append({"role": "tool", "content": out, "tool_name": name})
+            self._save_chat()
             if tb.finished:
                 break
-        # 3 test happened inside submit (if the model submitted); 4 plan comes from finish
-        fin = tb.finished or {}
-        if not fin:
-            plans, pick, reason = self.plan_next(k, rec, tb)
-            fin = {"summary": "(the model did not call finish)", "next_plans": plans, "picked": pick, "pick_reason": reason}
+        fin = tb.finished or self.plan_next(k, tb)
+        self.chat.append({"role": "user", "content": f"[loop] Cycle {k} is over. Next: {fin['next_plans'][fin['picked']]}"}); self._save_chat()
         rec.update(summary=fin["summary"], next_plans=fin["next_plans"], picked=fin["picked"], pick_reason=fin.get("pick_reason", ""),
-                   submitted=tb.submitted, kept=bool(tb.submitted and tb.submitted.get("kept")), tools_used=len(tb.log),
-                   tool_log=tb.log[-60:], generation_after=self.lineage["current"], minutes=round((time.time() - t0) / 60, 1))
+                   test_runs=[{x: t[x] for x in ("run_id", "suite", "n", "models")} for t in tb.test_runs], switches=tb.switches,
+                   generation_after=self.lineage["current"], model_after=self.tag, tools_used=len(tb.log), tool_log=tb.log[-80:],
+                   minutes=round((time.time() - t0) / 60, 1))
         return rec
 
-    def _inbox(self):
-        p = self.s.p("inbox.jsonl")
-        return [json.loads(l)["text"].strip() for l in open(p).read().splitlines()] if os.path.exists(p) else []
-
-    def _trim(self, msgs, budget=None):
-        """keep the conversation inside the context window: shorten old tool results first"""
-        budget = budget or self.cfg["num_ctx"] * 3
-        size = lambda: sum(len(str(m.get("content", ""))) for m in msgs)
-        for m in msgs[2:-6]:
-            if size() <= budget:
-                break
-            if m["role"] == "tool" and len(m["content"]) > 400:
-                m["content"] = m["content"][:200] + " …[shortened]… " + m["content"][-150:]
-        return msgs
-
-    def plan_next(self, k, rec, tb):
-        """fallback when the model never called finish: ask it directly for plans"""
-        msgs = [{"role": "system", "content": open(PLAYBOOK).read()},
-                {"role": "user", "content": f"Cycle {k} ended. What you did: " + json.dumps(tb.log[-12:], default=str)[:6000] +
-                 "\n\nPropose 2 to 4 plans for the next cycle and pick one."}]
+    def plan_next(self, k, tb):
+        """the model stopped without calling finish: ask it for a summary and plans directly"""
+        msgs = [{"role": "system", "content": self.system_prompt()}] + self._trim(self.chat) + [
+            {"role": "user", "content": "[loop] The cycle is over. Summarise what you did and learned, propose 2 to 4 goals for the next "
+                                        "cycle, and pick one. Answer in JSON."}]
         try:
-            r = llm.chat(self.cfg, self.tag, msgs, think=self.cfg["pilot_think"], fmt=PLANS, num_predict=self.cfg["pilot_num_predict"],
-                         live={"slot": "pilot", "title": "planning the next cycle"})
+            r = llm.chat(self.cfg, self.tag, msgs, think=settings.think(self.cfg.get("pilot_think", "on")), fmt=PLANS,
+                         num_predict=self.cfg["pilot_num_predict"], live={"slot": "pilot", "title": "planning the next cycle"})
             d = json.loads(r["message"]["content"])
-            plans = [p.get("plan") if isinstance(p, dict) else str(p) for p in d.get("plans", [])][:4]
+            plans = [str(p) for p in d.get("plans", [])][:4]
             if plans:
-                return plans, min(max(int(d.get("pick", 0)), 0), len(plans) - 1), d.get("reason", "")
+                return {"summary": d.get("summary", ""), "next_plans": plans, "picked": min(max(int(d.get("pick", 0)), 0), len(plans) - 1),
+                        "pick_reason": d.get("reason", "")}
         except Exception:  # noqa: BLE001
             pass
-        return ["look at the practice traces and try one concrete change to my weights"], 0, "fallback"
+        return {"summary": "(the model ended the cycle without a summary)", "next_plans": ["continue toward the main goal"], "picked": 0, "pick_reason": "fallback"}
 
     def run(self):
-        open(self.s.p("loop.pid"), "w").write(str(os.getpid())); self.cycle_k = 0
+        open(self.s.p("loop.pid"), "w").write(str(os.getpid()))
 
         def term(*_):
             try:
@@ -450,19 +445,26 @@ class Loop:
             last = hist[-1]; direction = {"from": "model", "text": last["next_plans"][last.get("picked", 0)]}
         seen = len(self._inbox())
         while True:
-            texts = [t for t in self._inbox()[seen:] if t]; seen = len(self._inbox())
+            box = self._inbox(); texts = [t for t in box[seen:] if t]; seen = len(box)
             if texts:
                 direction = {"from": "human", "text": texts[-1]}   # your direction beats the model's own pick
             try:
                 rec = self.cycle(k, direction)
                 direction = {"from": "model", "text": rec["next_plans"][rec["picked"]]}
             except Exception as e:  # noqa: BLE001
-                rec = {"cycle": k, "generation": self.lineage["current"], "kept": False, "summary": f"error: {type(e).__name__}: {e}",
+                rec = {"cycle": k, "generation": self.lineage["current"], "summary": f"error: {type(e).__name__}: {e}",
                        "trace": traceback.format_exc()[-2000:]}
                 self.status(k, "error", rec["summary"][:150]); time.sleep(30)
             with open(self.s.p("history.jsonl"), "a") as f:
                 f.write(json.dumps(rec, default=str) + "\n")
-            k += 1
+            k += 1; self.cycle_k = k
+            self.reload()
+            if not self.cfg.get("auto_continue", True):   # wait for the human before the next cycle
+                self.status(k, "waiting", "waiting for your message to start the next cycle")
+                while len(self._inbox()) <= seen:
+                    time.sleep(2); self.reload()
+                    if self.cfg.get("auto_continue", True):
+                        break
 
 
 if __name__ == "__main__":

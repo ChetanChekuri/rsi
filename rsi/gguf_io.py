@@ -104,17 +104,47 @@ def derive_run_quant(src, dst, qtype, llama_quantize="/usr/local/lib/ollama/llam
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def register(tag, gguf_path, base_tag, host=None):
-    """ollama create `tag` from gguf_path, keeping every other Modelfile line of base_tag. `host` must be a server
-    allowed to write the model store (a user-level capped server usually is not)."""
+DIRECTIVES = ("PARAMETER", "SYSTEM", "TEMPLATE", "ADAPTER", "MESSAGE", "LICENSE", "RENDERER", "PARSER")
+
+
+def merge_modelfile(base, extra):
+    """apply Modelfile lines from `extra` on top of `base`: directives it sets replace the base's (PARAMETERs per key)"""
+    if not (extra or "").strip():
+        return base
+    keys, params = set(), set()
+    for l in extra.splitlines():
+        m = re.match(r"^(\w+)\s*(\S*)", l)
+        if m and m.group(1).upper() in DIRECTIVES:
+            if m.group(1).upper() == "PARAMETER":
+                params.add(m.group(2).lower())
+            else:
+                keys.add(m.group(1).upper())
+    out = base
+    for k in keys:
+        out = re.sub(rf'^{k} """.*?"""[ \t]*$', "", out, flags=re.M | re.S | re.I)
+        out = re.sub(rf"^{k} .*$", "", out, flags=re.M | re.I)
+    for k in params:
+        out = re.sub(rf"^PARAMETER {re.escape(k)} .*$", "", out, flags=re.M | re.I)
+    return re.sub(r"\n{3,}", "\n\n", out).rstrip() + "\n" + extra.strip() + "\n"
+
+
+def register(tag, gguf_path, base_tag, host=None, extra=""):
+    """ollama create `tag`: the weights in gguf_path (or base_tag's own weights when None), every other Modelfile line
+    of base_tag (projector, renderer, parser, parameters), then the Modelfile lines in `extra` on top. `host` must be
+    a server allowed to write the model store."""
     blob, mf = ollama_show(base_tag, host)
-    mf = mf.replace(f"FROM {blob}", f"FROM {os.path.abspath(gguf_path)}", 1)
+    if gguf_path:
+        mf = mf.replace(f"FROM {blob}", f"FROM {os.path.abspath(gguf_path)}", 1)
+    mf = merge_modelfile(mf, extra)
     with tempfile.NamedTemporaryFile("w", suffix=".Modelfile", delete=False) as f:
         f.write(mf); path = f.name
     try:
-        subprocess.run(["ollama", "create", tag, "-f", path], check=True, capture_output=True, env=_env(host))
+        p = subprocess.run(["ollama", "create", tag, "-f", path], capture_output=True, text=True, env=_env(host))
+        if p.returncode:
+            raise RuntimeError((p.stderr or p.stdout).strip()[-800:])
     finally:
         os.unlink(path)
+    return mf
 
 
 def unregister(tag, host=None):

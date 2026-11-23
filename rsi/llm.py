@@ -1,9 +1,7 @@
 """Talking to models through ollama. Every generation streams into <session>/.rsi/live/<slot>.json while it is
 produced, which is what the app's live pane shows. A dead server raises instead of returning empty answers (empty
 answers would be scored as wrong and look like a broken model)."""
-import json, os, re, threading, time, urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from . import probes
+import json, os, time, urllib.error, urllib.request
 
 LIVE = {"dir": None}
 
@@ -46,11 +44,13 @@ def _stream(req, timeout, live, model):
     return {"message": msg, "done_reason": final.get("done_reason"), "eval_count": final.get("eval_count", 0)}
 
 
-def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=None, seed=0, live=None, timeout=7200):
+def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=None, seed=0, live=None, timeout=7200, options=None):
     """one chat call; with `live` ({"slot": ..., "title": ...}) it streams into the live dir"""
     stream = bool(live and LIVE["dir"])
     body = {"model": model, "stream": stream, "think": think, "messages": messages,
-            "options": {"seed": seed, "num_predict": num_predict or cfg["num_predict"], "num_ctx": cfg["num_ctx"]}}
+            "options": {"seed": seed, "num_predict": num_predict or cfg["num_predict"], "num_ctx": cfg["num_ctx"], **(options or {})}}
+    if cfg.get("keep_alive"):
+        body["keep_alive"] = cfg["keep_alive"]
     if tools:
         body["tools"] = tools
     if fmt:
@@ -63,6 +63,10 @@ def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=Non
                 return _stream(req, timeout, live, model)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:   # a bad request (unknown model, bad option): retrying won't help
+                raise ValueError(f"ollama refused the request for {model}: {e.read().decode(errors='ignore')[:300]}")
+            err = e; time.sleep(10 * (attempt + 1))
         except Exception as e:  # noqa: BLE001
             err = e; time.sleep(10 * (attempt + 1))
     raise ServerDown(f"ollama unreachable for {model}: {err}")
@@ -75,34 +79,3 @@ def unload(cfg, model):
         urllib.request.urlopen(req, timeout=120).read()
     except Exception:  # noqa: BLE001
         pass
-
-
-def solve(cfg, tag, items, path, who="solving"):
-    """the model solves `items` in thinking mode; results are cached in `path` (jsonl) so nothing is solved twice"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    done = {}
-    if os.path.exists(path):
-        for l in open(path):
-            r = json.loads(l); done[r["id"]] = r
-    todo = [it for it in items if it["id"] not in done]
-
-    def one(it):
-        r = chat(cfg, tag, [{"role": "user", "content": it["prompt"]}], think=True,
-                 live={"slot": "subject-" + threading.current_thread().name.split("_")[-1], "title": f"{who}: {it['id']}",
-                       "prompt": it["prompt"][:1500], "gold": it.get("gold", "")})
-        m = r["message"]; content = m.get("content", "")
-        if it["kind"] == "code":
-            from .sandbox import grade_code
-            blocks = re.findall(r"```(?:python)?\n(.*?)```", content, re.S)
-            pred = blocks[-1] if blocks else content
-            ok = bool(pred.strip()) and grade_code(pred, it["tests"], it["entry_point"])
-        else:
-            pred = probes.extract(content); ok = probes.grade(it, pred)
-        return {"id": it["id"], "suite": it["suite"], "gold": it.get("gold", ""), "kind": it["kind"], "prompt": it["prompt"],
-                "thinking": m.get("thinking", ""), "content": content, "pred": pred[:2000], "correct": ok,
-                "done_reason": r.get("done_reason"), "tokens": r.get("eval_count", 0)}
-    with open(path, "a") as f, ThreadPoolExecutor(cfg["workers"]) as ex:
-        for rec in ex.map(one, todo):
-            f.write(json.dumps(rec) + "\n"); f.flush(); done[rec["id"]] = rec
-    unload(cfg, tag)
-    return [done[it["id"]] for it in items]

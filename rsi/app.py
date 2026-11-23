@@ -1,8 +1,9 @@
-"""rsi: one screen. Left: what the model is producing right now (scrolls as it streams). Right: what it is doing, the
-plans it made for the next cycle, and every cycle so far. Bottom: type to steer the next cycle (optional).
+"""rsi: one screen. Left: what the model is producing right now (scrolls as it streams). Right: what it is doing, its
+latest test results, the plans it made for the next cycle, and every cycle so far. Bottom: talk to it.
 
     rsi            open the loop for this folder (in a new folder: pick a model and a goal first)
     rsi stop       stop this folder's loop (until you open rsi there again)
+    rsi settings   ollama, thinking budget, limits, sandbox (see rsi/settings.py)
 """
 import glob, json, os, sys, time
 from rich.console import Group
@@ -13,10 +14,11 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, Label, Select, Static, TextArea
-from .loop import Session, create, models, plan
+from .loop import Session, create, models
+from . import settings
 
 ACC, WARN, GOOD, BAD, DIM = "#5fd7d7", "#ffd75f", "#87d787", "#ff8787", "grey58"
-STEPS = ["practice", "work", "test", "plan"]
+STEPS = ["thinking", "research", "code", "build", "test", "switch", "plan"]
 KIND = {"call": (ACC, "→ "), "result": ("#8a98a3", "  "), "model": ("#e6edf2", ""), "human": (WARN, "you: "), "note": (GOOD, "· ")}
 CSS = """
 Screen { background: #1b1e23; }
@@ -40,14 +42,14 @@ class New(Screen):
         super().__init__(); self.folder = folder
 
     def compose(self) -> ComposeResult:
-        host = os.environ.get("RSI_OLLAMA_ADMIN_URL", os.environ.get("RSI_OLLAMA_URL", "http://127.0.0.1:11434")).split("://")[-1]
+        host = settings.for_new_loop(True)["ollama_admin_url"].split("://")[-1]
         try:
             ms = models(host)
         except Exception:  # noqa: BLE001
             ms = []
         with VerticalScroll(id="new"):
-            yield Static(Text.assemble((" rsi ", f"bold black on {ACC}"), ("  a model that edits its own weights, one tested change at a time", "bold")))
-            yield Static(Text(f"new loop in {self.folder}", style=DIM))
+            yield Static(Text.assemble((" rsi ", f"bold black on {ACC}"), ("  a model that works on itself: it writes its own tests, changes itself, and decides whether to switch", "bold")))
+            yield Static(Text(f"new loop in {self.folder}   (settings for new loops: rsi settings --global)", style=DIM))
             yield Label("Model")
             yield Select([(f"{m['tag']}   ({m['size']})", m["tag"]) for m in ms], prompt="choose a model", id="model")
             yield Label("Main prompt: what should it get better at?  (it plans every cycle after this on its own)")
@@ -159,14 +161,23 @@ class Main(Screen):
         line = Text()
         for s_ in STEPS:
             on_ = s_ == step
-            line.append("● " if on_ else "○ ", ACC if on_ else DIM); line.append(s_ + "    ", f"bold {ACC}" if on_ else DIM)
-        now = [line, Text(st.get("detail", ""), style="bold")]
+            line.append("● " if on_ else "○ ", ACC if on_ else DIM); line.append(s_ + "   ", f"bold {ACC}" if on_ else DIM)
+        now = [line, Text(st.get("detail", ""), style="bold"), Text(f"now running as {st.get('model', '')}", style=DIM)]
+        runs = (self.s.read("state/test_runs.json", []) or [])[-4:]
+        if runs:
+            now += [Text(""), Text("latest tests", style=DIM)]
+            for r in reversed(runs):
+                st_ = r.get("settings") or {}
+                opts = ", ".join(x for x, on in (("think", st_.get("think") not in (False, "off")), ("internet", st_.get("internet")), ("code", st_.get("code"))) if on)
+                scores = "   ".join(f"{m.split(':')[-1]} {v['score']:.0%}" + (f" (+{v['vs_baseline']['fixed']}/−{v['vs_baseline']['broken']})" if v.get("vs_baseline") else "")
+                                   for m, v in r["models"].items())
+                now += [Text.assemble((f"{r['suite']}", ACC), (f"  n={r['n']}  {opts}", DIM)), Text("  " + scores)]
         if hist:
-            h = hist[-1]; sub = h.get("submitted") or {}
+            h = hist[-1]
             now += [Text(""), Text(f"last cycle ({h.get('tools_used', 0)} tool calls, {h.get('minutes', '?')} min)", style=DIM),
                     Text(h.get("summary", ""), style="italic")]
-            if sub:
-                now += [Text(f"submitted {sub.get('model')}: {sub.get('verdict', '')}", style=GOOD if sub.get("kept") else BAD)]
+            for sw in h.get("switches") or []:
+                now += [Text(f"switched {sw['from'].split(':')[-1]} → {sw['to'].split(':')[-1]}: {sw.get('reason', '')}", style=GOOD)]
             if h.get("next_plans"):
                 now += [Text(""), Text("its plans for the next cycle", style=DIM)]
                 for i, p in enumerate(h["next_plans"]):
@@ -174,22 +185,21 @@ class Main(Screen):
                     now += [Text(("▶ " if chosen else "  ") + str(p), style=f"bold {ACC}" if chosen else DIM)]
                 if h.get("pick_reason"):
                     now += [Text(f"picked because: {h['pick_reason']}", style="italic")]
-        models = self.s.read("state/models.json", []) or []
-        if models:
-            now += [Text(""), Text("models it has built: " + ", ".join(m["tag"].split(":")[-1] for m in models[-6:]), style=DIM)]
+        ms = self.s.read("state/models.json", []) or []
+        if ms:
+            now += [Text(""), Text("models it has built: " + ", ".join(m["tag"].split(":")[-1] for m in ms[-8:]), style=DIM)]
         self.query_one("#now", Static).update(Group(*now))
         # all cycles
         tb = Table(box=None, expand=True, header_style=f"bold {ACC}", pad_edge=False)
-        for c in ("#", "gen", "practice", "plan from", "submitted", "held-out (goal)", ""):
+        for c in ("#", "model after", "goal from", "tests", "switched", "summary"):
             tb.add_column(c)
         for h in reversed(hist):
-            sub = h.get("submitted") or {}; g = sub.get("goal") or {}
             src = (h.get("direction") or {}).get("from", "goal") if isinstance(h.get("direction"), dict) else "goal"
-            tb.add_row(str(h["cycle"]), str(h.get("generation", "")), f"{(h.get('practice') or {}).get('accuracy', 0):.0%}",
-                       {"human": "you", "model": "itself"}.get(src, src), (sub.get("model") or "-").split(":")[-1],
-                       f"{g['before']:.0%} → {g['after']:.0%}" if g.get("before") is not None else "-",
-                       Text("kept" if h.get("kept") else ("not kept" if sub else (h.get("summary", "")[:24] if h.get("summary", "").startswith("error") else "")),
-                            style=GOOD if h.get("kept") else BAD))
+            sw = h.get("switches") or []
+            err = (h.get("summary") or "").startswith("error")
+            tb.add_row(str(h["cycle"]), (h.get("model_after") or h.get("model") or "").split(":")[-1], {"human": "you", "model": "itself"}.get(src, src),
+                       str(len(h.get("test_runs") or [])), Text("yes" if sw else "no", style=GOOD if sw else DIM),
+                       Text((h.get("summary") or "")[:60], style=BAD if err else ""))
         self.query_one("#cycles-box", VerticalScroll).border_title = f"cycles ({len(hist)})"
         self.query_one("#cycles", Static).update(tb if hist else Text("the first cycle is running", style=DIM))
 
@@ -215,6 +225,8 @@ class RSI(App):
 
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["settings"]:
+        return settings.main(args[1:], os.getcwd())
     if args[:1] == ["stop"]:
         s = Session(args[1] if len(args) > 1 else os.getcwd())
         print("stopped" if s.stop() else "no loop is running here"); return
