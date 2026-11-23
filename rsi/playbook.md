@@ -168,6 +168,11 @@ Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
   the most critical layer is attention layer 15 (+0.60), then layer 2 (+0.56) and layer 6 (+0.44, where the sink
   dimension appears). Inside a layer, the work moves between parts: in linear layers 10 and 18 the MLP carries more,
   in attention layer 11 the attention does (+0.13 vs +0.03). Find out which part you're editing before you edit it.
+- The doubt behaviour is written mostly by the mixers, not the MLPs: removing the traced doubt direction (0.7,
+  layers 12-23) from the attention / linear-attention output matrices made the doubt word 1.6 nats less likely at
+  real post-answer "Wait" points; removing it from the MLP down-projections did nothing (+0.2); both together -2.0.
+  (10 points; the absolute log-probs were distorted by how the text was split, but every condition used the same
+  points.) Try mixer-only edits for behaviours tied to context ("I already have the answer"), and check MLP-only.
 
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python

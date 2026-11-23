@@ -353,7 +353,9 @@ class Loop:
                    f"\nMain goal: {self.cfg['goal']}\n")
         if not hist:
             opening += ("\nStart by deciding how to measure progress on the goal: write test suites in tests/ (see the playbook), "
-                        "run them on yourself, and read what goes wrong. Ready-made suites are in tests/library/.\n")
+                        "run them on yourself, and read what goes wrong. Ready-made suites are in tests/library/. Before you edit "
+                        "weights, map your own layers (playbook: 'How to measure your own model's map'): what matters in one "
+                        "model can be harmless in another.\n")
         if self.jobs.running():
             opening += f"\nBackground jobs still running: {', '.join(self.jobs.running())}.\n"
         opening += "\nWorkspace:\n" + tb.t_list_files()[:3000]
