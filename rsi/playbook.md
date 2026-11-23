@@ -36,6 +36,10 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
    - optional `grade.py` with `def grade(problem, response) -> float` (0..1). `response` has `content`, `thinking`,
      `tool_calls`, `done_reason`, `tokens`. Use it for code (run the tests), free-form answers, tool use, length limits.
      Without it, the last `Answer: ...` line is compared with `answer`.
+     Grade the answer the response *commits to* (its final answer line or concluding statement), never "the right
+     answer appears somewhere": responses that discuss every option then pass. (One check that accepted any reply
+     mentioning the right name scored 19/24 where the real score was 7/24.) Read a few graded responses by hand
+     before trusting a grader.
    - **If the goal has no checkable answer** (writing, explanations, design, advice, research, style), write
      `rubric.md` **before you run anything**, then grade strictly by it. Problems then need no `answer` (add
      `"reference"` with notes for the grader if useful). A good rubric:
@@ -239,13 +243,24 @@ Capabilities (coding, math, knowledge, writing) and the parameters behind them
   the local signal ignores what later layers do. Judge every candidate by generated answers in the real format. [ours, both]
 
 Reasoning, and gradients as a measuring tool
-- **Writing the steps out is the biggest reasoning lever for a small model.** Tracking values through several
-  steps failed when answering directly and became reliable with steps written out (8-step variable chains 0/8 ->
-  8/8; ordering people from 8 shuffled comparisons 2/8 -> 6/8). [ours, one model; lit agrees]
-- **Some reasoning isn't there to unlock.** Chaining if-then rules with conditions (and distractor rules) stayed at
-  chance with or without written steps: replies stopped without committing, invented premises ("Tom is dry, so
-  Tom must be wet") or reversed rules. Placeholders in format instructions were copied literally ("Answer:
-  <answer>"): give a concrete answer line instead. [ours, one model]
+- **Small models execute chains; they don't assemble them.** With the steps written out, a 1B model computed
+  8-step variable chains perfectly when the definitions came in computation order (8/8), and failed when the same
+  definitions were shuffled (0/8; 7/8 at 4 steps). Ordering people from shuffled comparisons collapsed the same
+  way (6/8 with 2 comparisons, 1/8 with 4, 0/8 with 8), and chaining if-then rules with conditions stayed at chance.
+  Asking it to reorder first barely helped (2/8): putting the pieces in order is the hard part. A small model
+  trained to think at length did assemble shuffled 8-step chains (3/3), spending ~1,900 tokens each, but ran out
+  of a 3,000-token budget on the rule problems without answering. [ours]
+- **Tools help when the problem translates literally into code.** Writing a program solved ordered and shuffled
+  chains that prose reasoning failed (8-step shuffled: 2/8 by program vs 0/8), but did nothing for ordering or rules
+  (1/12 each): the model could not encode the relations. [ours, one model]
+- **Voting needs good samples.** At temperature 0.7 a 1B model's sampled reasoning was right 7/40 times where its
+  greedy answer was right far more often, and majority voting over 5 samples could not recover it (3/8); at 0.3,
+  0/6. For small models, sample cooler or not at all before voting. [ours, one model; lit: self-consistency helps
+  larger models]
+- **Some reasoning isn't there to unlock.** On conditional rules, replies stopped without committing, invented
+  premises ("Tom is dry, so Tom must be wet") or reversed rules; an explicit step-by-step procedure in the system
+  prompt was not followed (it listed every word as known, then contradicted itself). Placeholders in format
+  instructions were copied literally ("Answer: <answer>"): give a concrete answer line instead. [ours, one model]
 - **Gradients can measure without training.** Back-propagate one decision token's loss into the activations of
   the last layers (batched, a few examples at a time; nothing is applied) and read each MLP neuron's gain
   gradient: activation x (output gradient . its ffn_down column), summed over tokens. [ours]
