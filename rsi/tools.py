@@ -38,7 +38,7 @@ MODEL_TOOLS = [
     _fn("run_tests", "Run a test suite from your workspace (tests/<name>/ with problems.jsonl and optional grade.py) on one or more "
         "models with the same settings. The first model is the baseline the others are compared with (default: just you). "
         "settings: think (true/false/low/medium/high), num_predict, internet (tested model gets web search), code (tested model "
-        "gets run_python), max_tool_steps, system, temperature, seed, n. Returns scores, fixed/broken vs the baseline with a "
+        "gets run_python), max_tool_steps, system, temperature, seed, n, judge (for a rubric suite's first run: who grades). A suite with rubric.md (and no answers) is graded strictly by that rubric; the rubric and judge are fixed on first use. Returns scores, fixed/broken vs the baseline with a "
         "sign-test p, and failing excerpts; full transcripts are saved in test_runs/.",
         {"suite": S, "models": {"type": "array", "items": S}, "settings": O}, ["suite"]),
     _fn("switch_model", "Become one of the models you built. Your whole conversation carries over to it and it continues "
@@ -185,6 +185,9 @@ class Toolbox:
             return "refused: that is your current self"
         if tag not in {m["tag"] for m in owned}:
             return f"refused: {tag} was not created by you (you may only delete your own models)"
+        judges = {k: v["judge"] for k, v in (self.L.s.read("state/rubrics.json", {}) or {}).items()}
+        if tag in judges.values():
+            return f"refused: {tag} is the fixed judge of rubric suite(s) {', '.join(k for k, v in judges.items() if v == tag)}"
         gguf_io.unregister(tag, self.L.admin)
         self.L.s.write("state/models.json", [m for m in owned if m["tag"] != tag])
         return f"deleted {tag}"
@@ -200,7 +203,8 @@ class Toolbox:
             settings = json.loads(settings) if settings.strip() else {}
         self.L.status_activity("test")
         summ, res = tests.run(self.cfg, self.ws, suite, ms, settings or {}, run_id=f"c{self.k}-{len(self.test_runs) + 1}-{time.strftime('%H%M%S')}",
-                              gate_dir=self.L.gate_dir, status=lambda d: self.L.status_activity("test", d))
+                              gate_dir=self.L.gate_dir, status=lambda d: self.L.status_activity("test", d),
+                              lock_path=self.L.s.p("state/rubrics.json"), judge=self.L.tag)
         self.test_runs.append(summ)
         tested = set(self.L.s.read("state/tested.json", []) or []) | set(ms)
         self.L.s.write("state/tested.json", sorted(tested))

@@ -6,6 +6,11 @@ A test suite is a folder in the workspace, tests/<name>/ (a single .jsonl file w
                    "content" (the final reply), "thinking", "tool_calls" ([{name, args, result}]), "done_reason", "tokens".
                    It runs in the sandbox, without internet. Without grade.py, the final answer (the last
                    "Answer: ..." line, else the last line) is compared with "answer" (or any of "answers").
+  rubric.md        for goals with no checkable answer (writing, design, advice, ...): a grading scale written BEFORE
+                   the first run. A judge model scores every response strictly by it, criterion by criterion, without
+                   knowing which model wrote it. Once a rubric has been used it is frozen (as is its judge): changing
+                   it means making a new suite, so scores stay comparable. Problems may add "reference" (notes for the
+                   judge). Precedence: grade.py, then rubric.md, then answers.
   settings.json    optional default run settings for the suite
 
 Run settings, picked by the model for each run (defaults come from rsi settings):
@@ -62,12 +67,15 @@ def load_suite(ws, suite):
                 raise ValueError(f"problem {d['id']} has no prompt")
             problems.append(d)
     grade = open(gf).read() if gf and os.path.exists(gf) else None
+    rf = os.path.join(p, "rubric.md") if os.path.isdir(p) else None
+    if grade is None and rf and os.path.exists(rf):
+        grade = {"rubric": open(rf).read()}
     try:
         defaults = json.load(open(sf)) if sf and os.path.exists(sf) else {}
     except ValueError:
         raise ValueError(f"{os.path.relpath(sf, ws)} must be one JSON object, e.g. {{\"think\": false, \"num_predict\": 2000}}")
     if grade is None and not all(("answer" in d or "answers" in d) for d in problems):
-        raise ValueError("without grade.py every problem needs an answer (or answers)")
+        raise ValueError("every problem needs an answer, unless the suite has a grade.py or a rubric.md (for goals without a checkable answer)")
     return p, problems, grade, defaults
 
 
@@ -157,9 +165,54 @@ def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
             "done_reason": r.get("done_reason"), "tokens": tokens, "seconds": round(time.time() - t0, 1)}
 
 
-def grade_all(cfg, ws, suite_path, grade_src, problems, records, gate_dir):
-    """scores for records (list of dicts); grade.py runs in the sandbox without internet"""
+JUDGE_SCHEMA = {"type": "object", "properties": {
+    "criteria": {"type": "array", "items": {"type": "object", "properties": {
+        "criterion": {"type": "string"}, "evidence": {"type": "string"}, "points": {"type": "number"}, "max_points": {"type": "number"}},
+        "required": ["criterion", "evidence", "points", "max_points"]}}}, "required": ["criteria"]}
+
+
+def judge_one(cfg, judge, rubric, problem, response):
+    """strict rubric grading of one response by the judge model; returns (score 0..1, per-criterion detail)"""
+    tools = "".join(f"\n- called {c['name']}({json.dumps(c['args'])[:300]}) -> {c['result'][:300]}" for c in response.get("tool_calls") or [])
+    prompt = ("You are a strict grader. Grade the RESPONSE to the TASK using only the RUBRIC. Go through every criterion in "
+              "the rubric, in order. For each, quote or point to the evidence in the response, then award points exactly as "
+              "the rubric's scale says. Apply the scale literally: when the response falls between two levels, give the lower "
+              "one; give no credit for anything the rubric doesn't reward; length, confidence and polish earn nothing unless "
+              "the rubric says so. You do not know who wrote the response.\n\n"
+              f"# RUBRIC\n{rubric}\n\n# TASK\n{problem['prompt']}\n"
+              + (f"\n# NOTES FOR THE GRADER\n{problem['reference']}\n" if problem.get("reference") else "")
+              + f"\n# RESPONSE\n{response.get('content', '')}\n" + (f"\n# TOOLS THE RESPONDER USED{tools}\n" if tools else "")
+              + "\nAnswer in JSON: one entry per rubric criterion.")
+    d = None
+    for think in (True, False):   # if thinking eats the whole budget, ask again without it
+        r = llm.chat(cfg, judge, [{"role": "user", "content": prompt}], think=think, fmt=JUDGE_SCHEMA,
+                     num_predict=max(8192, int(cfg.get("test_num_predict") or 0)), options={"temperature": 0},
+                     live={"slot": "judge", "title": f"grading {problem['id']} by the rubric ({judge})", "prompt": problem["prompt"][:1500]})
+        try:
+            d = json.loads(r["message"]["content"])
+            if d.get("criteria"):
+                break
+        except ValueError:
+            pass
+    if not d or not d.get("criteria"):
+        raise RuntimeError(f"the judge {judge} gave no usable verdict for {problem['id']}")
+    crit = [dict(c, points=min(max(float(c["points"]), 0.0), float(c["max_points"]))) for c in d["criteria"] if float(c.get("max_points") or 0) > 0]
+    if not crit:
+        raise ValueError("the judge returned no criteria")
+    return sum(c["points"] for c in crit) / sum(c["max_points"] for c in crit), crit
+
+
+def grade_all(cfg, ws, suite_path, grade_src, problems, records, gate_dir, judge=None):
+    """scores for records (list of dicts); grade.py runs in the sandbox without internet; a rubric is applied by `judge`"""
     byid = {p["id"]: p for p in problems}
+    if isinstance(grade_src, dict):
+        out = []
+        for r in records:
+            if "rubric_score" not in r or r.get("judge") != judge:
+                r["rubric_score"], r["rubric_detail"] = judge_one(cfg, judge, grade_src["rubric"], byid[r["id"]], r); r["judge"] = judge
+            out.append(r["rubric_score"])
+        llm.unload(cfg, judge)
+        return out
     if not grade_src:
         return [default_grade(byid[r["id"]], r) for r in records]
     d = os.path.join(ws, ".grading"); os.makedirs(d, exist_ok=True)
@@ -183,9 +236,29 @@ def grade_all(cfg, ws, suite_path, grade_src, problems, records, gate_dir):
     return scores
 
 
-def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, status=None):
-    """run a suite on several models with the same settings; the first model is the baseline for comparisons"""
+def rubric_lock(lock_path, ws, path, grade_src, judge):
+    """a rubric (and its judge) is fixed the first time it is used; returns the judge to use"""
+    if not isinstance(grade_src, dict):
+        return None
+    locks = json.load(open(lock_path)) if lock_path and os.path.exists(lock_path) else {}
+    key = os.path.relpath(path, ws); h = hashlib.sha1(grade_src["rubric"].encode()).hexdigest()
+    if key in locks:
+        if locks[key]["sha1"] != h:
+            raise ValueError(f"{key}/rubric.md changed after it was first used ({locks[key]['at']}). Rubrics are fixed so scores stay "
+                             "comparable: put the new rubric in a new suite (copy the problems) instead.")
+        return locks[key]["judge"]
+    locks[key] = {"sha1": h, "judge": judge, "at": time.strftime("%Y-%m-%d %H:%M")}
+    if lock_path:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        json.dump(locks, open(lock_path, "w"), indent=1)
+    return judge
+
+
+def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, status=None, lock_path=None, judge=None):
+    """run a suite on several models with the same settings; the first model is the baseline for comparisons.
+    For a rubric suite, `judge` (or settings["judge"], or the judge_model setting) grades; it is fixed on first use."""
     path, problems, grade_src, defaults = load_suite(ws, suite)
+    judge = rubric_lock(lock_path, ws, path, grade_src, (settings or {}).get("judge") or cfg.get("judge_model") or judge or models[0])
     opts = {"think": cfg.get("test_think", True), "num_predict": cfg.get("test_num_predict") or cfg.get("num_predict", 4096),
             "internet": False, "code": False, "max_tool_steps": cfg.get("test_max_tool_steps", 6), "seed": 0}
     opts.update({k: v for k, v in defaults.items() if k in RUN_KEYS})
@@ -199,7 +272,7 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
     run_id = run_id or time.strftime("run-%m%d-%H%M%S-") + os.urandom(2).hex()
     out_dir = os.path.join(ws, "test_runs", run_id); os.makedirs(out_dir, exist_ok=True)
     cache_dir = os.path.join(ws, "test_runs", ".cache"); os.makedirs(cache_dir, exist_ok=True)
-    suite_key = hashlib.sha1((json.dumps(problems, sort_keys=True) + (grade_src or "") +
+    suite_key = hashlib.sha1((json.dumps(problems, sort_keys=True) + (grade_src if isinstance(grade_src, str) else json.dumps(grade_src or "")) +
                               json.dumps({k: opts.get(k) for k in RUN_KEYS if k != "n"}, sort_keys=True)).encode()).hexdigest()
     results = {}
     for m in models:
@@ -224,14 +297,19 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
                     f.write(json.dumps(rec) + "\n"); f.flush(); done[rec["id"]] = rec
         llm.unload(cfg, m)
         recs = [done[p["id"]] for p in problems]
-        for r, s in zip(recs, grade_all(cfg, ws, path, grade_src, problems, recs, gate_dir)):
+        for r, s in zip(recs, grade_all(cfg, ws, path, grade_src, problems, recs, gate_dir, judge)):
             r["score"] = float(s)
+        if isinstance(grade_src, dict):   # keep the judge's verdicts so unchanged answers aren't judged again
+            with open(cache, "w") as f:
+                for r in done.values():
+                    f.write(json.dumps(r) + "\n")
         with open(os.path.join(out_dir, re.sub(r"[^\w.-]", "_", m) + ".jsonl"), "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
         results[m] = recs
     summary = summarize(results, models)
-    summary.update(run_id=run_id, suite=os.path.relpath(path, ws), n=len(problems), settings=opts,
+    summary.update(run_id=run_id, suite=os.path.relpath(path, ws), n=len(problems), settings=opts, graded_by=(
+                   f"rubric, judged by {judge}" if judge else ("grade.py" if grade_src else "answers")),
                    files=os.path.relpath(out_dir, ws), at=time.strftime("%Y-%m-%d %H:%M"))
     json.dump(summary, open(os.path.join(out_dir, "summary.json"), "w"), indent=1)
     return summary, results

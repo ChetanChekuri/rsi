@@ -35,6 +35,7 @@ SCHEMA = [
     ("test_think", "Tests (defaults)", "Thinking", "choice", "on", "the model can choose differently for each test run"),
     ("test_num_predict", "Tests (defaults)", "Token budget", "int", (4096, 16384), "per reply of the tested model"),
     ("test_max_tool_steps", "Tests (defaults)", "Tool rounds", "int", 6, "per problem, when a test gives the tested model tools"),
+    ("judge_model", "Tests (defaults)", "Rubric judge", "str", "", "who grades rubric suites; empty = the model in charge when a rubric is first used"),
     ("test_workers", "Tests (defaults)", "Parallel problems", "int", 0, "0 = decided from the hardware"),
     ("max_models", "Models", "Models kept at once", "int", (8, 3), "how many models it may have registered (each is a full copy); 0 = no limit"),
 ]

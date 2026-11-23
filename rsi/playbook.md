@@ -29,6 +29,17 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
    - optional `grade.py` with `def grade(problem, response) -> float` (0..1). `response` has `content`, `thinking`,
      `tool_calls`, `done_reason`, `tokens`. Use it for code (run the tests), free-form answers, tool use, length limits.
      Without it, the last `Answer: ...` line is compared with `answer`.
+   - **If the goal has no checkable answer** (writing, explanations, design, advice, research, style), write
+     `rubric.md` **before you run anything**, then grade strictly by it. Problems then need no `answer` (add
+     `"reference"` with notes for the grader if useful). A good rubric:
+     - lists 3-8 criteria that together define success for this goal, each with a point scale and a concrete
+       description of every level ("2: every claim is supported by a cited source; 1: most are; 0: few or none"),
+     - includes deductions for the failures you actually care about (wrong facts, ignoring a constraint, padding),
+     - never rewards length, confidence or polish unless the goal is about them,
+     - is specific enough that two careful graders would give the same points.
+     A judge model (by default, you as you are now) scores each response criterion by criterion without knowing which
+     model wrote it. The rubric and its judge are frozen on first use; if you must change the rubric, make a new
+     suite. Read a few judgments (`rubric_detail` in `test_results()`) to check the judge applies it as you meant.
    - optional `settings.json` with default run settings.
    - Keep two suites per goal: a **build** set you study while changing yourself, and a **held-out** set you only use
      to decide. Ready-made general suites are in `tests/library/` (GSM8K, ARC-Challenge): use one to check you didn't
