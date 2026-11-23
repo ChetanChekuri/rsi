@@ -303,18 +303,21 @@ Reasoning, and gradients as a measuring tool
   halves agree almost perfectly (cosine 0.96) carries a blanket output shift, not the missing computation, and that
   step broke other skills. Steering by error rate kept feeding such stuck problems back in; drop a problem type
   once a step shows it doesn't move. [ours, one model]
-- **Richer steps can reach what gain steps can't, by a route you didn't choose.** Low-rank steps on whole matrices
-  (attention output and MLP output in the last 12 of 16 layers; gradients sketched in one pass, so no full
-  weight gradient is ever stored: two small random projections per matrix recover its top directions exactly, and
-  4 directions held 99% of a batch's gradient) went where gain steps could not. On word problems the first step
-  put 94% of its change into one attention output matrix, which carried the missing number to the answer: the
-  model started subtracting it, from the wrong quantity (boxes minus the giveaway). The next step switched the
-  model to writing out its working: word problems 1/16 -> 16/16 and held-out arithmetic 35 -> 58/60 (+23/-0) when
-  allowed to finish, while it no longer obeyed "reply with just the number" (0/120 bare answers). [ours, one model]
-- **The acceptance test decides what the loop learns.** Graded under the instruction's own rules, that step looked
-  like a collapse (46 -> 34/60); graded by outcome, it was the best model by far. Gradient steps optimize the
-  outcome by whatever route is cheapest for the model, including changing how it answers. Check the outcome and
-  each constraint (format, instructions, length) separately, and decide which ones a step may trade. [ours]
+- **Richer steps find the cheapest route, which may be disobedience.** Low-rank steps on whole matrices (attention
+  output and MLP output in the last 12 of 16 layers; gradients sketched in one pass: two small random projections
+  per matrix recover its top directions exactly, and 4 directions held 99% of a batch's gradient) were aimed at
+  word problems under "reply with just the number". The first put 94% of its change into one attention output
+  matrix and the model began subtracting the missing number, from the wrong quantity; the second made it ignore
+  the instruction and write out its working (0/120 bare answers), which looked like a leap (word problems 1/16 ->
+  16/16). It wasn't: asked the question alone, the untouched model already solved 120/120 by working it out. The
+  step had only learned to drop the format. [ours, one model]
+- **Compare against the untouched model under the same freedom, and check every constraint.** Graded under the
+  instruction's own rules that step looked like a collapse (46 -> 34/60); graded by outcome it looked like the best
+  model; against the untouched model given the same room it added nothing. Gradient steps optimize the outcome by
+  whatever route is cheapest, including changing how the model answers. Measure the outcome under each prompt
+  format, each constraint (format, instructions, length) separately, and the baseline under identical conditions.
+  The real gain here was the earlier gain-step model: bare-number accuracy 68 -> 89/120 while still solving 119/120
+  when free to work it out. [ours]
 - **Margin-gradient gains can beat blind amplification, but not on every model.** Setting ~2,000 late-layer
   neurons' gains from the averaged math margin gradient lifted generated arithmetic 28 -> 38/60 (+10/-0; the same
   change on random neurons 28/60; blind amplification 35/60), cost one fact in 32, and did not help multi-step word
