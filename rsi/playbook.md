@@ -38,7 +38,8 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
      Without it, the last `Answer: ...` line is compared with `answer`.
      Grade the answer the response *commits to* (its final answer line or concluding statement), never "the right
      answer appears somewhere": responses that discuss every option then pass. (One check that accepted any reply
-     mentioning the right name scored 19/24 where the real score was 7/24.) Read a few graded responses by hand
+     mentioning the right name scored 19/24 where the real score was 7/24; another that took the first number
+     marked "45 / 5 = 9" wrong.) Read a few graded responses by hand
      before trusting a grader.
    - **If the goal has no checkable answer** (writing, explanations, design, advice, research, style), write
      `rubric.md` **before you run anything**, then grade strictly by it. Problems then need no `answer` (add
@@ -285,6 +286,23 @@ Reasoning, and gradients as a measuring tool
   with the largest gradient effect wiped out math but also broke facts and code; zeroing the most capability-
   specific neurons hurt math alone. The two sets barely overlap. Use the first to find what an output depends on,
   the second to find what belongs to one capability. [ours]
+- **Step, look, re-measure.** Training in small observed steps (measure the margin gradient at the *current*
+  weights on a fresh batch, change neuron gains by ~1.5%, rebuild, test generated answers, let the dev-set errors
+  pick the next batch) kept improving where a single edit stopped: chat arithmetic 35 -> 42 -> 46/60 on held-out
+  problems over five steps (+11/-0 overall; facts and code unchanged within one item). Each new gradient was
+  nearly orthogonal to the last (cosine 0.08, -0.30, -0.04): what the model needs changes after every step, so
+  re-measure instead of repeating one direction. Gains stopped once the trained problem types were solved (92% of
+  the batch already right). [ours, one model]
+- **Accept or reject each step on a dev set the steps never train on.** Two of six steps made things worse (a
+  word-problem step undid the addition fix: held-out 45 -> 37) and were rolled back. Snapshot the weights at every
+  step; a rolled-back step must restore exactly. [ours]
+- **Steps fix slips in a procedure the model already runs, not a missing step.** They removed systematic carry
+  errors in addition (answers off by exactly +10) and most multiplication errors, but did not teach word problems
+  (the model added the "gives away" amount instead of subtracting it) or three-term sums (it dropped a term): there
+  the steps only moved where the wrong answers landed. Red flag: a batch the model gets ~0% right whose gradient
+  halves agree almost perfectly (cosine 0.96) carries a blanket output shift, not the missing computation, and that
+  step broke other skills. Steering by error rate kept feeding such stuck problems back in; drop a problem type
+  once a step shows it doesn't move. [ours, one model]
 - **Margin-gradient gains can beat blind amplification, but not on every model.** Setting ~2,000 late-layer
   neurons' gains from the averaged math margin gradient lifted generated arithmetic 28 -> 38/60 (+10/-0; the same
   change on random neurons 28/60; blind amplification 35/60), cost one fact in 32, and did not help multi-step word
