@@ -47,7 +47,8 @@ MODEL_TOOLS = [
     _fn("run_tests", "Run a test suite from your workspace (tests/<name>/ with problems.jsonl and optional grade.py) on one or more "
         "models with the same settings. The first model is the baseline the others are compared with (default: just you). "
         "settings: think (true/false/low/medium/high), num_predict, internet (tested model gets web search), code (tested model "
-        "gets run_python), max_tool_steps, system, temperature, seed, n, judge (for a rubric suite's first run: who grades). A suite with rubric.md (and no answers) is graded strictly by that rubric; the rubric and judge are fixed on first use. Returns scores, fixed/broken vs the baseline with a "
+        "gets run_python), max_tool_steps, system, temperature, top_k, top_p, min_p, presence_penalty, repeat_penalty (unset = the "
+        "model's Modelfile values, shown in the result), seed, n, judge (for a rubric suite's first run: who grades). A suite with rubric.md (and no answers) is graded strictly by that rubric; the rubric and judge are fixed on first use. Returns scores, fixed/broken vs the baseline with a "
         "sign-test p, and failing excerpts; full transcripts are saved in test_runs/.",
         {"suite": S, "models": {"type": "array", "items": S}, "settings": O}, ["suite"]),
     _fn("switch_model", "Become one of the models you built. Your whole conversation carries over to it and it continues "

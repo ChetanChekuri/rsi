@@ -53,7 +53,8 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
      get worse at everything else.
 2. **Pick the test settings** to match how you will be used: `think` (true/false/"low"/"medium"/"high"),
    `num_predict` (token budget), `internet` and `code` (the tested model gets web search / a Python tool),
-   `max_tool_steps`, `system`, `temperature`, `n`.
+   `max_tool_steps`, `system`, sampling (`temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty`,
+   `repeat_penalty`; unset = the model's Modelfile values), `n`.
 3. **Test yourself** (`run_tests(suite, ["self"], settings)`), then **read the failing transcripts** before the averages.
 4. **Change yourself.** Anything goes; some options, from cheap to expensive:
    - Modelfile only: sampling parameters, a system prompt, a template (no new weights; seconds).
@@ -159,8 +160,12 @@ Editing
   unfinished answers on a small model (30% -> 74% on fresh problems) at the cost of overconfident probabilities.
   [ours; the arithmetic is general]
 - **Sampling settings are part of the model.** Temperature and repetition/presence penalties change what the
-  model writes as much as small weight edits do (a presence penalty discourages repeating digits it just wrote).
-  Check the Modelfile parameters before blaming the weights. [lit; our test was cut short]
+  model writes as much as small weight edits do. A presence penalty lowers every token that appeared recently,
+  digits included: it is harmless when the model is confident (greedy copying of repeated numbers: 10/10 with and
+  without it) but hurts where it is unsure (sampled multiplications: 36% without vs 24% with a 1.5 penalty, 50
+  each; suggestive). [lit + ours] run_tests shows each model's Modelfile sampling values and lets you override
+  them (temperature, top_k, top_p, min_p, presence_penalty, repeat_penalty): test under the settings you'll be used
+  with, and consider fixing bad defaults with a Modelfile PARAMETER line instead of a weight edit.
 
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python

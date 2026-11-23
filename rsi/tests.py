@@ -23,13 +23,15 @@ Run settings, picked by the model for each run (defaults come from rsi settings)
   code           the tested model gets run_python (its own sandbox, with internet only if `internet` is on)
   max_tool_steps how many tool rounds the tested model may use per problem
   system         a system prompt for the tested model
-  temperature, seed, n (only the first n problems)
+  temperature, top_k, top_p, min_p, presence_penalty, repeat_penalty (unset = the model's own Modelfile values)
+  seed, n (only the first n problems)
 """
 import hashlib, json, math, os, re, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from . import llm, research, sandbox, probes
 
-RUN_KEYS = ("think", "num_predict", "internet", "code", "max_tool_steps", "system", "temperature", "seed", "n")
+SAMPLING = ("temperature", "top_k", "top_p", "min_p", "presence_penalty", "repeat_penalty")   # override the Modelfile's
+RUN_KEYS = ("think", "num_predict", "internet", "code", "max_tool_steps", "system", "seed", "n") + SAMPLING
 CODE_TOOL = {"type": "function", "function": {"name": "run_python", "description": "Run Python code and see its output (stdout/stderr).",
                                               "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}}
 WEB_TOOLS = [t for t in research.TOOLS if t["function"]["name"] in ("web_search", "fetch_page")]
@@ -128,6 +130,16 @@ def model_digests(cfg):
         return {}
 
 
+def modelfile_params(cfg, model):
+    """the sampling parameters baked into a model's Modelfile (they apply unless a run overrides them)"""
+    try:
+        req = urllib.request.Request(cfg["ollama_url"] + "/api/show", json.dumps({"model": model}).encode(), {"Content-Type": "application/json"})
+        txt = json.loads(urllib.request.urlopen(req, timeout=30).read()).get("parameters", "")
+        return {l.split()[0]: l.split()[1] for l in txt.splitlines() if len(l.split()) >= 2}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
     """the tested model answers one problem, with the tools the run settings allow"""
     own = [t if "function" in t else {"type": "function", "function": t} for t in problem.get("tools") or []]
@@ -136,7 +148,7 @@ def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
     msgs = ([{"role": "system", "content": opts["system"]}] if opts.get("system") else []) + (
         problem["messages"] if problem.get("messages") else [{"role": "user", "content": problem["prompt"]}])
     calls, tokens, t0, r = [], 0, time.time(), None
-    extra = {k: opts[k] for k in ("temperature",) if opts.get(k) is not None}
+    extra = {k: opts[k] for k in SAMPLING if opts.get(k) is not None}
     for step in range(int(opts.get("max_tool_steps", 6)) + 1):
         r = llm.chat(cfg, model, msgs, think=opts.get("think", True), tools=tools or None, num_predict=opts.get("num_predict"),
                      seed=int(opts.get("seed", 0)), options=extra,
@@ -317,6 +329,7 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
                 f.write(json.dumps(r) + "\n")
         results[m] = recs
     summary = summarize(results, models)
+    summary.update(model_sampling_defaults={m: modelfile_params(cfg, m) for m in models})
     summary.update(run_id=run_id, suite=os.path.relpath(path, ws), n=len(problems), settings=opts, graded_by=(
                    f"rubric, judged by {judge}" if judge else ("grade.py" if grade_src else "answers")),
                    files=os.path.relpath(out_dir, ws), at=time.strftime("%Y-%m-%d %H:%M"))
