@@ -138,83 +138,136 @@ def save(path, key, value):
 
 
 # ------------------------------------------------------------------------------------------------ the screen
-def app(path, small, label):
+@__import__('functools').lru_cache(None)
+def _screen_classes():
     from rich.text import Text
     from textual import on
     from textual.app import App
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.screen import Screen
     from textual.widgets import Footer, Input, Select, Static, Switch
 
-    vals, _ = load(path, small)
+    ACC, DIM, GOOD, BAD, WARN = "#5fd7d7", "#6f7d89", "#87d787", "#ff8787", "#ffd75f"
 
-    class Settings(App):
+    class SettingsScreen(Screen):
+        """every setting, grouped; switches and choices save at once, text fields when you press enter or leave them"""
         CSS = """
-        Screen { background: #1b1e23; }
-        #head { padding: 1 2 0 2; }
-        VerticalScroll { padding: 0 2; }
-        .section { color: #5fd7d7; text-style: bold; margin-top: 1; }
-        .row { height: auto; margin-bottom: 1; }
-        .text { width: 1fr; }
-        .help { color: grey; }
-        .row Input, .row Select { width: 34; }
-        .row Switch { width: 12; }
-        #msg { dock: bottom; height: 1; padding: 0 2; color: #87d787; }
+        SettingsScreen { background: #13161b; }
+        #shead { padding: 1 2 0 2; height: auto; }
+        #sbody { padding: 0 2; }
+        .section { color: #5fd7d7; text-style: bold; margin-top: 1; border-bottom: solid #2b343e; }
+        .row { height: auto; padding: 0 0 0 1; margin-top: 1; }
+        .text { width: 1fr; height: auto; }
+        .help { color: #6f7d89; }
+        .row Input, .row Select { width: 36; }
+        .row Switch { width: 10; }
+        .row Input.-bad { border: tall #ff8787; }
+        .row Input.-dirty { border: tall #ffd75f; }
+        #smsg { dock: bottom; height: 1; padding: 0 2; background: #191e25; }
         """
-        BINDINGS = [("ctrl+q", "quit", "close"), ("escape", "quit", "close")]
+        BINDINGS = [Binding("escape", "close", "Back"), Binding("ctrl+q", "close", "Back")]
+
+        def __init__(self, path, small, label):
+            super().__init__(); self.path, self.small, self.label = path, small, label
+            self.vals, _ = load(path, small); self.ready = False
 
         def compose(self):
-            yield Static(Text.assemble((" rsi settings ", "bold black on #5fd7d7"), (f"  {label}", "bold"),
-                                       ("\n changes are saved at once; a running loop uses them from its next step", "grey58")), id="head")
-            with VerticalScroll():
+            yield Static(Text.assemble((" rsi settings ", f"bold #13161b on {ACC}"), (f"  {self.label}", "bold"),
+                                       ("\n switches save at once; text fields when you press enter or leave them. A running loop "
+                                        "uses them from its next step.", DIM)), id="shead")
+            with VerticalScroll(id="sbody"):
                 sec = None
                 for key, section, lab, typ, _, hlp in SCHEMA:
                     if section != sec:
                         sec = section; yield Static(section, classes="section")
                     with Horizontal(classes="row"):
                         with Vertical(classes="text"):
-                            yield Static(lab)
-                            yield Static(f"{hlp}   [{key}]", classes="help")
-                        v = vals.get(key)
+                            yield Static(Text(lab, style="bold"))
+                            dflt = default(key, self.small)
+                            yield Static(Text.assemble((hlp, DIM), (f"   {key}", "#4b5864"),
+                                                       (f"   default {dflt if dflt not in (None, '') else 'empty'}", "#4b5864")), classes="help")
+                        v = self.vals.get(key)
                         if typ == "bool":
                             yield Switch(value=bool(v), id=f"s-{key}")
                         elif typ == "choice":
                             yield Select([(c, c) for c in THINK], value=think_label(v), allow_blank=False, id=f"s-{key}")
                         else:
                             yield Input("" if v is None else str(v), id=f"s-{key}")
-            yield Static("", id="msg")
+            yield Static("", id="smsg")
             yield Footer()
 
         def on_mount(self):
-            self.ready = False
             self.call_after_refresh(lambda: setattr(self, "ready", True))   # widgets report their initial values: ignore those
 
-        def _set(self, key, raw):
-            if not getattr(self, "ready", False):
-                return
+        def action_close(self):
+            if len(self.app.screen_stack) > 2:
+                self.app.pop_screen()
+            else:
+                self.app.exit()
+
+        def _msg(self, text, color=GOOD):
+            self.query_one("#smsg", Static).update(Text(text, style=color))
+
+        def _save(self, key, raw):
+            if not self.ready:
+                return False
             try:
                 v = parse(key, raw)
             except ValueError as e:
-                self.query_one("#msg", Static).update(Text(f"{key}: expected {e}", style="#ff8787"))
-                return
-            if v == vals.get(key):
-                return
-            save(path, key, v); vals[key] = v
-            self.query_one("#msg", Static).update(f"saved {key} = {v}")
+                self._msg(f"{key}: expected {e}", BAD); return False
+            if v != self.vals.get(key):
+                save(self.path, key, v); self.vals[key] = v; self._msg(f"saved {key} = {v}")
+            return True
 
         @on(Switch.Changed)
         def sw(self, ev):
-            self._set(ev.switch.id[2:], "on" if ev.value else "off")
+            self._save(ev.switch.id[2:], "on" if ev.value else "off")
 
         @on(Select.Changed)
         def sel(self, ev):
             if ev.value is not Select.BLANK:
-                self._set(ev.select.id[2:], ev.value)
+                self._save(ev.select.id[2:], ev.value)
 
         @on(Input.Changed)
-        def inp(self, ev):
-            self._set(ev.input.id[2:], ev.value)
+        def typing(self, ev):   # validate as you type, save later
+            if not self.ready:
+                return
+            key = ev.input.id[2:]
+            try:
+                v = parse(key, ev.value); ok = True
+            except ValueError:
+                ok = False; v = None
+            ev.input.set_class(not ok, "-bad"); ev.input.set_class(ok and v != self.vals.get(key), "-dirty")
 
-    return Settings()
+        @on(Input.Submitted)
+        def submit(self, ev):
+            if self._save(ev.input.id[2:], ev.value):
+                ev.input.remove_class("-dirty")
+
+        @on(Input.Blurred)
+        def leave(self, ev):
+            if ev.input.has_class("-dirty") and self._save(ev.input.id[2:], ev.input.value):
+                ev.input.remove_class("-dirty")
+
+    class SettingsApp(App):
+        def __init__(self, path, small, label):
+            super().__init__(); self.args = (path, small, label)
+
+        def on_mount(self):
+            self.push_screen(SettingsScreen(*self.args))
+
+    return SettingsScreen, SettingsApp
+
+
+def __getattr__(name):   # settings.SettingsScreen without importing textual for the command line
+    if name == "SettingsScreen":
+        return _screen_classes()[0]
+    raise AttributeError(name)
+
+
+def app(path, small, label):
+    return _screen_classes()[1](path, small, label)
 
 
 def think_label(v):

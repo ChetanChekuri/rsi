@@ -11,7 +11,9 @@ rsi            # in any folder: pick a model, type the main prompt (the goal), t
 rsi settings   # ollama servers, thinking budget, limits, sandbox
 ```
 
-![rsi: the model's work streamed live](docs/rsi_live.svg)
+![rsi: a test answer streaming live, with the step pipeline, latest scores, next plans and cycle history](docs/rsi_live.svg)
+
+![rsi: the conversation tab, with the model's messages, highlighted code it ran, and results](docs/rsi_screen.svg)
 
 Each folder is its own loop: state in `<folder>/.rsi/`, the model's files in `<folder>/workspace/`. The loop runs in
 the background, so closing the window (ctrl+q) doesn't stop it; `rsi stop` does. Run `rsi` in the folder again to
@@ -24,10 +26,13 @@ reconnect (or restart it). After a crash or reboot it resumes where it was, with
 | `rsi` | in a new folder: choose a model and type the main prompt; in a folder with a loop: reconnect (and resume it unless it was stopped) |
 | `rsi PATH` | the same for another folder |
 | `rsi stop` / `rsi stop PATH` | stop that folder's loop; it stays stopped until you open `rsi` there again |
+| `rsi watch` / `rsi watch PATH` | open the screen without starting or resuming the loop |
 | `rsi settings` | edit this folder's loop settings (in a folder without a loop: the defaults for new loops) |
 | `rsi settings --global` | edit the defaults for new loops |
 | `rsi settings list` / `rsi settings KEY VALUE` | print / set them from the shell |
 | type + Enter | talk to the model while it works (it reads your message at its next step); the message also becomes the next cycle's goal |
+| F1-F6 | tabs: Live, Conversation, Tests, Models, Jobs, Log |
+| ctrl+l / ctrl+s / ctrl+o | type a message / stop or resume the loop (asks before stopping) / settings |
 | ctrl+q | close the window; the loop keeps running |
 
 ## A cycle
@@ -52,9 +57,13 @@ There is no fixed script: the model has tools and a playbook, and decides. The p
 7. **Finish:** a summary, 2–4 goals for the next cycle, and its pick. The next cycle starts on that goal, unless you
    typed one.
 
-The left pane shows, live, whatever is being generated: the model's thinking, its tool calls and their results, or
-a test problem being solved. The right pane shows what it's doing, its latest test results, its plans, and every
-cycle so far.
+The screen has a header (model and current version, generation, cycle, what it is doing and for how long, the
+goal), six tabs and a sidebar. **Live** streams whatever is being generated: the model's thinking and reply, or a test
+problem being solved with its answer key. **Conversation** is the whole exchange: its messages (rendered), the code it
+runs (highlighted), results, your messages. **Tests** lists every run with scores, fixed/broken against the baseline
+and the sign-test p; highlight one to see its settings and failing answers. **Models** shows its lineage (switches,
+undone switches) and the models it built; **Jobs** its background jobs with live output; **Log** the loop's own log.
+The sidebar shows the step it is on, its latest scores, its plans for the next cycle and every cycle so far.
 
 ## The model's tools
 
