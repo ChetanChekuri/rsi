@@ -9,6 +9,8 @@
     requantize("b.gguf", "b-q4.gguf", "Q4_K_M")                        # llama.cpp quantizer
     chat("rsi-xyz:b", "What is 17*23?")                                # talk to any model on the ollama server
     test_results()                      # the transcripts of your latest run_tests
+    m = measure_gradient([(chat_text("17 x 6? Just the number."), "102"), ...])   # which way weights want to move
+    gradient_step(m, "step1.gguf")                                     # one small step, as a new GGUF
 
 Then call the ollama_create tool to register a GGUF as a model, and run_tests to compare it with yourself.
 Only the workspace persists. Inside the sandbox `pip install` puts packages in .pkgs/ (already on the path).
@@ -221,6 +223,65 @@ def check_stream(S=None, model=None):
     """(agreed, total, details): does the stream predict the same next token as ollama does for this model?"""
     from rsi.arch_generic import check_stream as chk
     return chk(S or stream(), model or info()["current_model"])
+
+
+def chat_text(user, S=None, system=None, thinking=False, assistant_prefix=""):
+    """your chat template (from the GGUF) rendered for one user turn, so an answer can follow; for measure_gradient"""
+    from rsi.gradstep import chat_text as ct
+    return ct(S or stream(), user, system, thinking, assistant_prefix)
+
+
+def measure_gradient(examples, path=None, S=None, **kw):
+    """Which way do your weights want to move on these examples? Nothing is applied.
+    examples: [(prompt_text, answer_text)]; the loss is on the answer tokens only (build prompts with chat_text, in
+    the exact format you are used in). path: the weights to measure (default: your current ones; measure a candidate
+    you built to take the next step from it). Options: layers (default: second half), loss="margin" (correct vs your
+    top wrong token; "nll" also available but chases cheap shifts), targets (matrix names), rank, batch.
+    Returns a dict whose "summary" says: loss before, answer-token accuracy, how much the examples agree on one
+    direction (agreement_between_halves: ~0 none, ~0.5-0.8 a shared skill, ~1 a blanket shift), and which matrices
+    the gradient is in. See the playbook: "Training yourself in observed steps"."""
+    from rsi.gradstep import measure
+    path = path or current_gguf(); m = measure(S or stream(path), examples, **kw); m["base"] = path
+    return m
+
+
+def gradient_step(m, out, kind="gains", size=None, top=None):
+    """One small step against a measurement, written as a new GGUF (from the weights that were measured).
+    kind="gains": scale the output columns of the `top` neurons with the largest gain gradients (default 3% of the
+       measured neurons) so that the mean change is `size` (default 0.015 = 1.5%); each change is capped at 30%.
+    kind="lowrank": add the measured top gradient directions of each target matrix (attention/MLP outputs), scaled
+       so the total change is `size` (default 0.003 = 0.3%) of the measured matrices' norm. Can change behaviour
+       more than gains, including how you answer (check every format you are used in).
+    Returns {"path", "kind", "size", "changed"}. Register it with ollama_create, test it with run_tests, and measure
+    the next step from it (measure_gradient(path=...)) only if it passed."""
+    from rsi.gguf_io import GGUF
+    base = m["base"]; g = GGUF(base); edits, changed = {}, 0
+    if kind == "gains":
+        G = m["gain_grads"].mean(0); layers = m["gain_layers"]; n = G.shape[1]
+        size = 0.015 if size is None else size; top = top or max(1, int(0.03 * G.size))
+        idx = np.argsort(-np.abs(G).ravel())[:top]; s = size / (np.abs(G.ravel()[idx]).mean() + 1e-30)
+        d = np.clip(-s * G.ravel()[idx], -0.3, 0.3); cols = {}
+        for i, dd in zip(idx, d):
+            cols.setdefault(layers[int(i) // n], {})[int(i) % n] = 1.0 + float(dd)
+        for l, c in cols.items():
+            name = f"blk.{l}.ffn_down.weight"; W = np.array(g.deq(name), dtype=np.float32); js = list(c)
+            W[:, js] *= np.array([c[j] for j in js], dtype=np.float32); edits[name] = W; changed += len(js)
+    elif kind == "lowrank":
+        size = 0.003 if size is None else size
+        names = {k: f"blk.{l}.{kind_}.weight" for k in m["factors"] for kind_, l in [k]}
+        Ws = {k: np.array(g.deq(nm), dtype=np.float32) for k, nm in names.items()}
+        wn = np.sqrt(sum(float((W ** 2).sum()) for W in Ws.values())); gn = np.sqrt(sum(e[0] for e in m["energy"].values()))
+        eta = size * wn / (gn + 1e-30)
+        for k, (U, V) in m["factors"].items():
+            edits[names[k]] = Ws[k] - eta * (U @ V.T); changed += 1
+    else:
+        raise ValueError("kind is 'gains' or 'lowrank'")
+    del g
+    try:
+        path = write_model(edits, out, base=base)
+    except AssertionError:   # tensor types that can't be overwritten in place: re-encode
+        path = write_gguf(out, tensors=edits, base=base)
+    return {"path": path, "kind": kind, "size": size, "changed": changed}
 
 
 def doubt_direction(records, post_answer=True, path=None):

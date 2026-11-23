@@ -104,8 +104,48 @@ test_results()                # {model: records} of your latest test run
 S = stream()                  # layer-streaming forward pass: activations and log-likelihoods (see rsi/arch_qwen35.py)
 D, rows = doubt_direction(test_results()["..."])   # example: the direction behind "Wait…/Hmm…" lines
 ablate(W, r, a); amplify(W, r, b); writers(layer); n_layers()
+p = chat_text("17 x 6 = ? Reply with just the number.")   # your chat template, ready for an answer to follow
+m = measure_gradient([(p, "102"), ...])          # which way your weights want to move on these answers (nothing applied)
+c = gradient_step(m, "step1.gguf", kind="gains") # one small step as a new GGUF ("gains" or "lowrank")
+m2 = measure_gradient(fresh_examples, path=c["path"])   # the next step is measured from the candidate you kept
 ```
 Matrices that write into the residual stream are each layer's `ssm_out`/`attn_output` and `ffn_down`.
+
+## Training yourself in observed steps
+
+Gradients here are a measuring instrument and a way to take one small, inspected step at a time; they are not a
+training run. Each step costs a measurement (seconds to minutes; use start_job for big models), a GGUF write, and a
+test run, and you look at what changed before deciding the next one.
+
+0. **Before the first step, write three test suites and score your untouched self on all of them:** the target
+   skill in the exact format you will be used in (a dev suite to decide with, and a separate test suite you never
+   step on), the same problems with no format constraint (room to work it out), and a guard suite for things that
+   must not get worse (facts, code, instruction following). Read some graded responses by hand.
+1. **Measure** at your current weights on a *fresh* batch (30-60 examples, never dev or test items), with the
+   prompt text exactly as you are used (chat_text, system prompt, thinking setting). Read `m["summary"]`:
+   - `margin_before`/`answer_token_accuracy_before`: near 100% means this skill is already solved; stop stepping it.
+   - `agreement_between_halves`: about 0.5-0.8 is a shared skill you can step on; near 0 (each example wants its
+     own change, typical of facts) means a fixed edit can't help; near 1 on a batch you mostly get wrong means a
+     blanket shift of your output, not the missing computation: such steps broke other skills.
+   - "where": which matrices carry the gradient (a single attention output often dominates when information has to
+     move between tokens).
+2. **Step small:** `gradient_step(m, ...)`, gains (~1.5% mean change on ~3% of neurons) first; lowrank (~0.3%) when
+   gains don't move the skill. Register the candidate (ollama_create) and run_tests on all suites against your
+   current self *and* against the untouched model.
+3. **Observe, then decide.** Keep the step only if the dev suite improves and the guard suite holds. Look at *how*
+   answers changed, not just the score: which problems flipped, what the wrong answers now equal (in one run, wrong
+   answers changed from "boxes x pencils" to "boxes - giveaway": the missing quantity had arrived, misapplied), and
+   whether the answer format changed. If the dev score jumps but answers stopped following the format, compare with
+   the untouched model given the same freedom: in one run a "gain" from 46 to 58/60 was only the model ignoring
+   "reply with just the number", which the untouched model already solved 120/120 when allowed to work it out.
+4. **Next step:** measure again from the kept candidate (`path=`), with a new batch. Successive gradients are
+   usually nearly orthogonal, so never reuse an old one. Steer the next batch toward the dev failures that moved;
+   drop a problem type after a step shows it doesn't move. Rejected steps: just go back to the previous file.
+5. Keep a log (steps.jsonl in your workspace): batch mix, summary, candidate path, scores, verdict, what you saw.
+
+What to expect (one 1B model, held-out chat arithmetic): five gain steps took 35 -> 46/60 (+11/-0) with facts and
+code unchanged; steps fixed slips in procedures already present (carries) but not missing steps; two harmful steps
+were caught by the dev suite and rolled back.
 
 ## How weights map to behaviour: general principles
 

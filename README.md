@@ -72,7 +72,13 @@ cycle so far.
 
 `rsi_lib` (importable in its code) has `read_tensor`, `write_model` (fast in-place copy), `write_gguf` (any change:
 new tensors, types, metadata, dropped layers), `requantize`, `chat` (talk to any model), `test_results`, `stream()`
-(a layer-streaming forward pass), and a few direction-editing helpers.
+(a layer-streaming forward pass), a few direction-editing helpers, and **gradient steps**: `measure_gradient`
+(back-propagates the loss of chosen answer tokens through the last layers and reports which way the weights want
+to move: neuron gain gradients, the top directions of each output matrix's gradient from a one-pass sketch, how
+much the examples agree, where the gradient sits; nothing is applied) and `gradient_step` (one small gain or
+low-rank step as a new GGUF). The playbook's "Training yourself in observed steps" says how the model should use
+them: one step at a time, measured from the last kept candidate, judged on dev, guard and free-format suites
+against the untouched model.
 
 ## The sandbox
 
@@ -172,6 +178,7 @@ rsi/app.py          the screen                 rsi_lib/         helpers importab
 rsi/jobs.py         background jobs
 rsi/arch_qwen35.py  layer-streaming forward pass for Qwen3.5/3.8 (~1 GB resident even for 27B)
 rsi/arch_generic.py the same for llama-family models, a GGUF tokenizer, check_stream
+rsi/gradstep.py     measuring gradients through the stream (gains, sketched low-rank directions); nothing applied
 rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions       rsi/detectors.py  failure patterns in a trace
 rsi/research.py     web / arXiv search         rsi/llm.py   talking to ollama (streams live)
