@@ -101,87 +101,75 @@ ablate(W, r, a); amplify(W, r, b); writers(layer); n_layers()
 ```
 Matrices that write into the residual stream are each layer's `ssm_out`/`attn_output` and `ffn_down`.
 
-## What is already known about Qwen3.5-0.8B (from earlier experiments)
+## How weights map to behaviour: general principles
 
-- Its main failure is **not stopping**: 361 of 368 "Wait/Hmm/let me double-check" lines came after the correct
-  answer had already appeared, so traces ran out of tokens.
-- Removing the direction behind those lines (rank-1 ablation, strength 0.5-0.7, on the residual writers of the second
-  half of the layers, direction from a late-middle layer) took it from 12/30 to 21/30. Above ~0.75 it broke tasks
-  that need checking.
-- Scaling `output_norm.weight` by 1.6 on top took it from 30% to 74% on 90 unseen problems (+42/−2), and 35% to 73%
-  on 60 more (+23/−0). Accuracy on problems both versions finished was the same: the gain was finishing.
-- Amplifying a direction toward concise reference reasoning made the model *rate* good reasoning as more likely but
-  *produce* worse reasoning.
+Labels: **[lit]** reported across many models in the research literature; **[ours]** seen in our own short
+experiments (so far on one hybrid-attention 0.8B model): treat these as hypotheses to check on yourself. Numbers in
+parentheses are worked examples, not facts about you.
 
-## How weights map to behaviour (measured; use it to choose where to edit)
+Where things happen
+- **Output forms late.** Reading each layer's residual through the output norm and vocabulary (the logit lens) shows
+  the final prediction taking shape only in the last part of the network. [lit] (example: under 6% agreement with
+  the final prediction until 2/3 of the depth, 55% one layer before the end.) Edits meant to change what you *say*
+  (wording, stopping, format) belong in the late layers; earlier layers hold more abstract features.
+- **Behaviours become word-shaped late and drift with depth.** A behaviour direction found from activations points
+  at its typical words only in the later layers, and the direction measured at one layer agrees less and less with
+  farther layers. [ours] (example: neighbouring layers cosine ~0.85, six layers apart ~0.6.) When editing several
+  layers, take a direction per layer or per small group, not one direction everywhere.
+- **A few parts matter far more than the rest.** Removing single layers costs very unequal amounts; the first and
+  last layers and a handful of middle ones (often full-attention layers in hybrid models) carry most of the load.
+  [lit + ours] Within a layer, which half does the work (attention-type mixer or MLP) changes from layer to layer.
+- **Behaviours tied to context can live in the attention-type writers, not the MLPs.** Removing a "second-guessing"
+  direction from the mixer outputs suppressed it; removing it from the MLP outputs did nothing. [ours, small n] Try
+  mixer-only and MLP-only versions of an edit before assuming MLPs hold behaviours.
 
-General findings (research literature):
-- Many LLMs (Llama, Mistral) have a few "super weights" in an early MLP down-projection that create giant,
-  input-independent "massive activations" (they act as biases and attention sinks). Zeroing one such scalar can
-  destroy the model. Before editing early `ffn_down` rows of a new model, look for residual dimensions with values
-  hundreds of times the median and leave the weights that write them alone.
-- Middle-to-late layers are often redundant: their output is nearly their input (cosine > 0.95), and in Llama-type
-  models they are the first candidates for skipping or pruning. The first and last layers matter most. (On
-  Qwen3.5-0.8B this cosine test proved a weak guide; see below: measure removal cost instead.)
-- A weight matrix's singular-value spectrum hints at how trained it is (heavy-tail exponent alpha ~2-4 well trained,
-  > 6 close to random). Post-training mostly rotates singular vectors and rescales singular values.
+What is (and isn't) important
+- **Magnitude is not importance.** Some residual dimensions are huge but carry almost no information (they can be
+  set to a constant or zeroed with no effect); others are small and essential. Rank parts by what removing them
+  does, never by size. [lit + ours]
+- **Massive activations and attention sinks.** Many models write a few giant, input-independent values (usually on
+  the first token) that act as fixed biases / attention sinks; in some models a single "super weight" in an early
+  MLP creates them and zeroing it destroys the model. [lit] Hybrid or gated-attention models may have much weaker
+  ones, but even a weak sink can matter (example: removing it cost 8%, flipping it 19%). Find yours before editing
+  early layers, and leave whatever writes it alone.
+- **Cheap similarity tests are weak guides.** "Layers whose output ≈ input are redundant" (cosine-based block
+  influence) works on some models [lit] but predicted removal cost poorly on ours (r = 0.36). Measuring the loss with a
+  layer removed takes one forward pass per layer: do that instead.
 
-Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
-- No super weight and almost no massive activation (one dim at layer 6, 111x the median, vs thousands in Llama):
-  its gated attention seems to remove them, so single-weight edits are not catastrophic here.
-- Block influence (1 - cos(in, out)): layer 0 0.90, layers 1-6 0.14-0.22, layers 8-13 and 16-22 only 0.04-0.07,
-  last layer 0.40. Skipping layer 21 entirely costs +0.09 nats/token; skipping layer 2 costs +0.77.
-- Spectra: MLP layers 6-14 look the most trained (alpha 4-5); the first and last MLPs look close to random (6-9).
-- The logit lens is unreadable before layer 18 and still mostly wrong at layer 22: the last layer writes the answer.
-  So per-layer "predict the next token" targets are noise in middle layers; edit the late layers through
-  behaviour directions instead.
-- Behaviour directions are not in the top singular units of single matrices: ranking SVD units by how much they push
-  "Wait/Hmm/Actually" found only noise (best z = 1.8). Find directions from traces (activation differences).
-- The one massive activation is an attention-sink marker: residual dim 119 is about -4 on the *first token* of every
-  text (-4.0, -4.2, -3.5 on three unrelated texts) and ~0 elsewhere. Removing it after layer 6 costs +8% loss and
-  flipping its sign +19%. Treat whatever writes it as untouchable.
-- Size is not importance: dims 0 and 46 are the largest residual dims at almost every layer, yet setting them to a
-  constant, or zeroing them, at layer 12 changes nothing (loss 1.673 -> 1.665-1.674). Rank parts by what removing
-  them does, not by magnitude.
-- A behaviour becomes "words" only late: the traced doubt direction, read through the vocabulary, barely favours
-  "Wait/Hmm/But" up to layer 8 (z 0-1), somewhat at 11-15 (z 2-3.6) and strongly from layer 16 on (z ~5). So edits
-  meant to change what the model *says* belong in the last third of the layers; earlier layers hold the
-  abstract version of the behaviour.
-- A cheap first guess for a behaviour direction needs no traces: (mean output-embedding of the target words - mean
-  of all words) x output-norm weights. For doubt words it matched the traced direction with cosine 0.23-0.27 in
-  layers 16-23 (8 random tokens: +-0.04). Partial: use it to start a search, then confirm with traces and tests.
-- Spectra don't see edits that matter: v2 (the doubt ablation that doubled accuracy) and v4 changed ffn_down alpha
-  by at most 0.02. Spectral health is not a substitute for testing a candidate.
-- Behaviour directions drift with depth: the traced doubt direction agrees with the neighbouring layer's (cosine
-  0.82-0.87) but only 0.59 between layers 16 and 22, and 0.29 between 8 and 22. When editing several layers, take a
-  direction per layer (or per few layers) rather than one direction everywhere.
-- Edit risk is about direction, not size: a random rank-1 change of 5% of ||W|| to ffn_down moved the loss by at most
-  0.002 at any of 10 layers. Block influence predicts what *removing* a layer costs, not what editing it costs
-  (correlation -0.03). An edit that matters is one aligned with something the model uses, so test aligned edits.
-- Repeating a layer is not free depth: on reasoning traces, running layer 10 or 4 twice helped slightly (-0.01
-  nats/token), layer 13 or 17 twice hurt (+0.06), and repeating layers 8-13 together hurt most (+0.12). Late layers
-  can't be repeated (layer 21 twice is worse than skipping it). If you try depth tricks, test one layer at a time.
-- Don't trust block influence to tell you which layers matter: across all 22 middle layers it correlated only 0.36
-  with the measured cost of removing the layer. Layer 22 (influence 0.08) costs +0.44 nats/token when removed and
-  layer 19 (0.08) +0.29, while layers 4, 8, 9, 20, 21 cost <= 0.08. Measure removal cost directly (one forward pass
-  per layer; seconds each). The full-attention layers matter more than the linear ones on average (+0.26 vs +0.19);
-  the most critical layer is attention layer 15 (+0.60), then layer 2 (+0.56) and layer 6 (+0.44, where the sink
-  dimension appears). Inside a layer, the work moves between parts: in linear layers 10 and 18 the MLP carries more,
-  in attention layer 11 the attention does (+0.13 vs +0.03). Find out which part you're editing before you edit it.
-- The doubt behaviour is written mostly by the mixers, not the MLPs: removing the traced doubt direction (0.7,
-  layers 12-23) from the attention / linear-attention output matrices made the doubt word 1.6 nats less likely at
-  real post-answer "Wait" points; removing it from the MLP down-projections did nothing (+0.2); both together -2.0.
-  (10 points; the absolute log-probs were distorted by how the text was split, but every condition used the same
-  points.) Try mixer-only edits for behaviours tied to context ("I already have the answer"), and check MLP-only.
+Editing
+- **Direction matters, not size.** Random changes of several percent of a matrix's norm barely move the model;
+  small changes aligned with something the model uses move it a lot. [ours; consistent with lit on low-rank edits]
+  Judge an edit's risk by what it is aligned with, and test aligned edits on behaviour.
+- **Behaviours aren't the top singular directions of single weight matrices**, and reading weights through the
+  vocabulary doesn't find them reliably. Find behaviour directions from activation differences on real traces.
+  A cheap first guess with no traces: (mean output-embedding of the behaviour's words − mean of all words) ×
+  output-norm weights; it captured part of a traced direction (cosine ~0.25). [ours] Use it to start, not to finish.
+- **Spectral health doesn't detect edits that matter.** The heavy-tail exponent of a matrix's spectrum is a rough
+  sign of how trained it is [lit], but useful rank-1 edits leave it unchanged. [ours] It can't replace testing.
+- **Repeating or skipping layers is not free.** Some middle layers can be repeated or removed cheaply, late layers
+  can't, and effects stack badly. [lit + ours] Test one layer at a time.
+- **Removing a failure works better than imposing a style.** Ablating the direction behind a specific failure
+  (rumination after the answer is already known) doubled accuracy; pulling the model toward another model's
+  reasoning style raised the likelihood of that style but made generated reasoning worse. [ours]
+- **Likelihood is not behaviour.** Making good text more probable under teacher forcing doesn't make the model
+  produce it: generation starts from its own imperfect steps. Judge every change by generated answers on held-out
+  tests. [lit + ours]
+- **The output norm is a built-in temperature knob.** Multiplying the final norm's weights by k sharpens every
+  prediction like dividing the temperature by k, and the result persists in any sampler. It fixed rambling and
+  unfinished answers on a small model (30% -> 74% on fresh problems) at the cost of overconfident probabilities.
+  [ours; the arithmetic is general]
+- **Sampling settings are part of the model.** Temperature and repetition/presence penalties change what the
+  model writes as much as small weight edits do (a presence penalty discourages repeating digits it just wrote).
+  Check the Modelfile parameters before blaming the weights. [lit; our test was cut short]
 
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
 S = stream()                                   # verify it with check_stream() first
 seqs = [S.enc(t) for t in some_texts]
 acts = S.run(seqs, capture=[{"pos": list(range(len(s)))} for s in seqs])[0]["pos"]   # {layer: (tokens, D)}
-# block influence of layer l: 1 - mean cosine(acts[l-1], acts[l]); low = redundant, safe to edit or skip
+# removal cost: replace S.block for layer l with `lambda l, x, W: x` and compare S.run(..., score=[{"nll": ...}])
 # massive dims: |acts[l]| hundreds of times the median, usually on the first token: don't touch their writers
-# logit lens: apply output_norm + LM head to acts[l]; the layer where it starts matching the final prediction is
-#   where the output takes shape; behaviour edits act from there on
-# test a hypothesis by changing one thing in S.block (zero a dim, skip a layer) and comparing S.run(..., score=nll)
+# logit lens: apply output_norm + LM head to acts[l]; where it starts matching the final prediction is where the
+#   output takes shape; word-level behaviour edits act from there on
+# to test any hypothesis, change one thing (zero a dim, drop a sublayer, remove a direction) and compare losses
 ```
