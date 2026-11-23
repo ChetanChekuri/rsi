@@ -120,8 +120,9 @@ General findings (research literature):
   input-independent "massive activations" (they act as biases and attention sinks). Zeroing one such scalar can
   destroy the model. Before editing early `ffn_down` rows of a new model, look for residual dimensions with values
   hundreds of times the median and leave the weights that write them alone.
-- Middle-to-late layers are often redundant: their output is nearly their input (cosine > 0.95). They are the
-  cheapest place for an edit and the first candidates for skipping or pruning. The first and last layers matter most.
+- Middle-to-late layers are often redundant: their output is nearly their input (cosine > 0.95), and in Llama-type
+  models they are the first candidates for skipping or pruning. The first and last layers matter most. (On
+  Qwen3.5-0.8B this cosine test proved a weak guide; see below: measure removal cost instead.)
 - A weight matrix's singular-value spectrum hints at how trained it is (heavy-tail exponent alpha ~2-4 well trained,
   > 6 close to random). Post-training mostly rotates singular vectors and rescales singular values.
 
@@ -160,6 +161,13 @@ Measured on Qwen3.5-0.8B (24 layers), each in under a minute:
 - Repeating a layer is not free depth: on reasoning traces, running layer 10 or 4 twice helped slightly (-0.01
   nats/token), layer 13 or 17 twice hurt (+0.06), and repeating layers 8-13 together hurt most (+0.12). Late layers
   can't be repeated (layer 21 twice is worse than skipping it). If you try depth tricks, test one layer at a time.
+- Don't trust block influence to tell you which layers matter: across all 22 middle layers it correlated only 0.36
+  with the measured cost of removing the layer. Layer 22 (influence 0.08) costs +0.44 nats/token when removed and
+  layer 19 (0.08) +0.29, while layers 4, 8, 9, 20, 21 cost <= 0.08. Measure removal cost directly (one forward pass
+  per layer; seconds each). The full-attention layers matter more than the linear ones on average (+0.26 vs +0.19);
+  the most critical layer is attention layer 15 (+0.60), then layer 2 (+0.56) and layer 6 (+0.44, where the sink
+  dimension appears). Inside a layer, the work moves between parts: in linear layers 10 and 18 the MLP carries more,
+  in attention layer 11 the attention does (+0.13 vs +0.03). Find out which part you're editing before you edit it.
 
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
