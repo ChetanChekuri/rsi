@@ -85,9 +85,11 @@ new tensors, types, metadata, dropped layers), `requantize`, `chat` (talk to any
 (back-propagates the loss of chosen answer tokens through the last layers and reports which way the weights want
 to move: neuron gain gradients, the top directions of each output matrix's gradient from a one-pass sketch, how
 much the examples agree, where the gradient sits; nothing is applied) and `gradient_step` (one small gain or
-low-rank step as a new GGUF). The playbook's "Training yourself in observed steps" says how the model should use
-them: one step at a time, measured from the last kept candidate, judged on dev, guard and free-format suites
-against the untouched model.
+low-rank step as a new GGUF), and **growth**: `grow_mlp` (new MLP neurons) and `grow_layers` (new layers) add
+parameters that start out changing nothing (replies stay word-for-word identical in ollama), and
+`gradient_step(kind="exact")` trains only those, everything else frozen. The playbook's "Training yourself in
+observed steps" and "Growing yourself" say how the model should use them: one step at a time, measured from the
+last kept candidate, judged on dev, guard and free-format suites against the untouched model.
 
 ## The sandbox
 
@@ -165,8 +167,8 @@ Any chat model ollama runs can be the starting model, and any can be tested:
   from the GGUF (`rsi/arch_generic.py`). Other architectures (Gemma, Phi-3, Granite, OLMo2, mixture-of-experts)
   are refused with the reason instead of being run wrongly; the model can subclass the stream for them.
   `check_stream()` confirms a forward pass agrees with ollama before it is trusted: 4/4 on Qwen3.5-0.8B and on
-  Llama-3.2-1B. The SentencePiece tokenizer follows llama.cpp's algorithm but has not yet been checked against a
-  real SentencePiece model.
+  Llama-3.2-1B; on TinyLlama (SentencePiece vocabulary, 4-bit weights) 4/4, and 8-token greedy continuations
+  matched ollama exactly on 4/4 prompts.
 
 The 0.8B runs on a laptop CPU; a 27B model needs a 24-48 GB GPU and plenty of disk (each GGUF-based model it builds
 is another full copy; `max_models` caps how many it keeps). The pilot should be a capable tool-using model: a 1B
@@ -199,7 +201,8 @@ rsi/app.py          the screen                 rsi_lib/         helpers importab
 rsi/jobs.py         background jobs
 rsi/arch_qwen35.py  layer-streaming forward pass for Qwen3.5/3.8 (~1 GB resident even for 27B)
 rsi/arch_generic.py the same for llama-family models, a GGUF tokenizer, check_stream
-rsi/gradstep.py     measuring gradients through the stream (gains, sketched low-rank directions); nothing applied
+rsi/gradstep.py     measuring gradients through the stream (gains, sketched low-rank directions, exact slices)
+rsi/grow.py         growing a model: wider MLPs, new layers, written so that nothing changes until trained
 rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions       rsi/detectors.py  failure patterns in a trace
 rsi/research.py     web / arXiv search         rsi/llm.py   talking to ollama (streams live)

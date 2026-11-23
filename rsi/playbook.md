@@ -108,6 +108,10 @@ p = chat_text("17 x 6 = ? Reply with just the number.")   # your chat template, 
 m = measure_gradient([(p, "102"), ...])          # which way your weights want to move on these answers (nothing applied)
 c = gradient_step(m, "step1.gguf", kind="gains") # one small step as a new GGUF ("gains" or "lowrank")
 m2 = measure_gradient(fresh_examples, path=c["path"])   # the next step is measured from the candidate you kept
+g = grow_mlp("wide.gguf", extra=256, layers=range(8, 16))   # new neurons that start out doing nothing
+g = grow_layers("deep.gguf", after=7, n=1)                  # or new layers that start as pass-throughs
+m = measure_gradient(ex, path=g["path"], exact=g["new"])    # exact gradient of only the new parameters
+c = gradient_step(m, "g1.gguf", kind="exact", size=0.01)    # train only them; grown(c["path"]) keeps the map
 ```
 Matrices that write into the residual stream are each layer's `ssm_out`/`attn_output` and `ffn_down`.
 
@@ -146,6 +150,32 @@ test run, and you look at what changed before deciding the next one.
 What to expect (one 1B model, held-out chat arithmetic): five gain steps took 35 -> 46/60 (+11/-0) with facts and
 code unchanged; steps fixed slips in procedures already present (carries) but not missing steps; two harmful steps
 were caught by the dev suite and rolled back.
+
+## Growing yourself: new parameters you can train
+
+Edits so far reuse the parameters you have. You can also add parameters and train only those, leaving everything
+you already know frozen:
+- `grow_mlp(out, extra, layers)` adds `extra` neurons to the MLP of each chosen layer (every layer gets the same
+  width; in unchosen layers the extra neurons are all-zero and stay dead). `grow_layers(out, after, n)` inserts `n`
+  new layers, copies of a neighbour whose output matrices are zero. Both start out computing exactly what you did:
+  ollama gave word-for-word identical replies after widening and after inserting layers, on Llama-3.2-1B,
+  Qwen3.5-0.8B (including a full-attention layer inserted into its hybrid pattern) and a 4-bit TinyLlama.
+- Train them with `measure_gradient(..., exact=g["new"])` and `gradient_step(m, out, kind="exact", size=...)`,
+  in observed steps exactly as above (fresh batches, dev/test/guard suites, keep or reject each step). Each grown
+  file carries its map of new parameters (`grown(path)`).
+- **Start tiny.** All new neurons see the same batch and write the same gradient direction: one step of size 0.1
+  (change = 10% of a typical weight) turned every arithmetic answer into 0, 1 or -1 (other arithmetic 19/30 ->
+  0/30). Size 0.01 was safe. [ours, one model]
+- **Mix in what must not break.** With a third of each batch drawn from other skills, those improved instead of
+  breaking (19 -> 23 -> 30/30) and facts stayed at 26/32. [ours, one model]
+- **The first step only trains the new output weights** (inputs get a gradient once outputs are nonzero), so the
+  second step behaves differently from the first.
+- **What new capacity did:** it quickly perfected a skill the model partly had (two-number arithmetic 19 -> 30/30
+  in two steps) and moved a missing one slowly: on word problems that need a subtraction the model skipped, right
+  answers went 3 -> 10 of 80 and answers within 3 of right 2 -> 9 after three steps, product-only answers 8 -> 2,
+  but answers that added instead of subtracting 7 -> 11. Missing steps may need more steps, capacity earlier in the
+  network, or written-out reasoning. [ours, one model]
+- Each grown model is a full copy on disk; growth itself streams one tensor at a time (a 1B model grows in ~20 s).
 
 ## How weights map to behaviour: general principles
 

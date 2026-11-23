@@ -41,15 +41,19 @@ def _tokens(S, prompt, answer):
     return ids + ans[:-1], [(len(ids) - 1 + i, t) for i, t in enumerate(ans)]
 
 
-def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sketch=24, batch=2, seed=0):
+def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sketch=24, batch=2, seed=0, exact=None):
     """examples: [(prompt_text, answer_text)]: the loss is on the answer's tokens only, given the prompt.
     loss="margin": correct token vs your own top wrong token (shared shifts in answer bias or format cancel);
            "nll": plain likelihood (beware: it rewards whatever shift is cheapest, e.g. always answering "Yes").
     layers: which layers to differentiate (default: the second half). Memory grows with them: all their weights are
     held while back-propagating; reduce layers or batch if you run out.
-    Returns a dict: summary, gain gradients per example (ffn_down neurons), low-rank gradient factors per matrix."""
+    exact: {tensor name: ["cols", indices] | ["rows", indices] | "all"} -> the exact gradient of just those weights
+    (what grow_mlp / grow_layers return as "new"), for training parameters you added.
+    Returns a dict: summary, gain gradients per example (ffn_down neurons), low-rank gradient factors per matrix, and
+    "exact": {name: (spec, gradient array)} (mean over examples)."""
     t0 = time.time()
-    L = S.L; layers = sorted(layers) if layers is not None else list(range(L // 2, L))
+    L = S.L; layers = sorted(layers) if layers is not None else list(range(L // 2, L)); exact = dict(exact or {})
+    start = min([layers[0]] + [int(n.split(".")[1]) for n in exact]); E = {}
     on = torch.as_tensor(np.array(S.g.deq("output_norm.weight")), device=S.dev)
     head = [(a, Wc.to(torch.bfloat16 if S.dev.type == "cpu" else Wc.dtype).clone()) for a, b, Wc in S._lm_chunks(chunk=32768)]
     S._lm = None   # the stream re-caches its output matrix when it next needs it; don't hold two copies
@@ -76,14 +80,16 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
                 emb = S._embed([s for s, _ in ex]); x = torch.zeros(B, T, S.D, device=S.dev)
                 for k, e in enumerate(emb):
                     x[k, :len(e)] = e
-                for l in range(layers[0]):
+                for l in range(start):
                     x = S.block(l, x, S._layer(l))
             x = x.detach().requires_grad_(True); cap.clear()
-            for l in range(layers[0], L):
+            for l in range(start, L):
                 W = S._layer(l)
                 watch.clear()
-                if l in layers:
-                    watch.update({id(W[f"blk.{l}.{n}"]): (n.split(".")[0], l) for n in targets if f"blk.{l}.{n}" in W})
+                for n in W:   # what to read in this layer: sketched targets (in `layers`) and exactly measured weights
+                    sk = l in layers and n.split(".", 2)[2] in targets
+                    if sk or n in exact:
+                        watch[id(W[n])] = (n.split(".")[2], l, n, sk)
                 x = S.block(l, x, W)
             h = S.rms(x[rb, rp], on)
             lg = torch.cat([(h.to(Wc.dtype) @ Wc.T).float() for _, Wc in head], -1); R = torch.arange(len(tg))
@@ -95,8 +101,19 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
             mg = mg.detach(); margins += [float(mg[rb == b].mean()) for b in range(B)]; hits += [float((lg.argmax(-1) == tg)[rb == b].float().mean()) for b in range(B)]
             with torch.no_grad():
                 per = {}
-                for (kind, l), xin, y, Wm in cap:
+                for (kind, l, name, sk), xin, y, Wm in cap:
                     dout = y.grad; key = (kind, l)
+                    if name in exact:   # exact gradient of the chosen slice: dW = dout^T x
+                        spec = exact[name]; d2_, i2_ = dout.reshape(-1, dout.shape[-1]).float(), xin.reshape(-1, xin.shape[-1]).float()
+                        if spec == "all":
+                            g_ = d2_.T @ i2_
+                        elif spec[0] == "cols":
+                            g_ = d2_.T @ i2_[:, torch.tensor(spec[1], device=i2_.device)]
+                        else:
+                            g_ = d2_[:, torch.tensor(spec[1], device=d2_.device)].T @ i2_
+                        E[name] = E[name] + g_ if name in E else g_
+                    if not sk:
+                        continue
                     if kind == "ffn_down":   # per-example neuron gain gradient: sum_t a_tj (dout_t . W[:, j])
                         per[l] = (xin * (dout @ Wm)).sum(1).float().cpu()
                     d2, i2 = dout.reshape(-1, dout.shape[-1]).float(), xin.reshape(-1, xin.shape[-1]).float()
@@ -128,5 +145,9 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
             p = rng.permutation(len(flat)); a, b = flat[p[:len(p) // 2]].mean(0), flat[p[len(p) // 2:]].mean(0)
             cs.append(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)))
         summ["agreement_between_halves"] = round(float(np.mean(cs)), 3)   # ~0: no shared direction; ~1: one shared shift
+    if exact:
+        summ["exact_grad_norm"] = {n: round(float(E[n].norm() / len(seqs)), 6) for n in E}
+        summ["exact_missing"] = [n for n in exact if n not in E]   # names that never passed through the forward pass
     return {"summary": summ, "gain_grads": G, "gain_layers": sorted({l for (k, l) in Y if k == "ffn_down"}),
-            "factors": factors, "energy": energy, "per_example_margin": margins}
+            "factors": factors, "energy": energy, "per_example_margin": margins,
+            "exact": {n: (exact[n], (E[n] / len(seqs)).cpu().numpy()) for n in E}}

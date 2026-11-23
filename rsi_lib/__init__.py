@@ -11,6 +11,8 @@
     test_results()                      # the transcripts of your latest run_tests
     m = measure_gradient([(chat_text("17 x 6? Just the number."), "102"), ...])   # which way weights want to move
     gradient_step(m, "step1.gguf")                                     # one small step, as a new GGUF
+    g = grow_mlp("wide.gguf", extra=256, layers=range(8, 16))         # new neurons (start inactive), or grow_layers
+    m = measure_gradient(ex, path=g["path"], exact=g["new"]); gradient_step(m, "w1.gguf", kind="exact")   # train them
 
 Then call the ollama_create tool to register a GGUF as a model, and run_tests to compare it with yourself.
 Only the workspace persists. Inside the sandbox `pip install` puts packages in .pkgs/ (already on the path).
@@ -227,7 +229,7 @@ def chat_text(user, S=None, system=None, thinking=False, assistant_prefix=""):
     return ct(S or stream(), user, system, thinking, assistant_prefix)
 
 
-def measure_gradient(examples, path=None, S=None, **kw):
+def measure_gradient(examples, path=None, S=None, exact=None, **kw):
     """Which way do your weights want to move on these examples? Nothing is applied.
     examples: [(prompt_text, answer_text)]; the loss is on the answer tokens only (build prompts with chat_text, in
     the exact format you are used in). path: the weights to measure (default: your current ones; measure a candidate
@@ -237,7 +239,7 @@ def measure_gradient(examples, path=None, S=None, **kw):
     direction (agreement_between_halves: ~0 none, ~0.5-0.8 a shared skill, ~1 a blanket shift), and which matrices
     the gradient is in. See the playbook: "Training yourself in observed steps"."""
     from rsi.gradstep import measure
-    path = path or current_gguf(); m = measure(S or stream(path), examples, **kw); m["base"] = path
+    path = path or current_gguf(); m = measure(S or stream(path), examples, exact=exact, **kw); m["base"] = path
     return m
 
 
@@ -270,14 +272,72 @@ def gradient_step(m, out, kind="gains", size=None, top=None):
         eta = size * wn / (gn + 1e-30)
         for k, (U, V) in m["factors"].items():
             edits[names[k]] = Ws[k] - eta * (U @ V.T); changed += 1
+    elif kind == "exact":   # train only the parameters measured with exact= (e.g. the ones you grew)
+        size = 0.1 if size is None else size
+
+        def ref_rms(name, W, spec):
+            """typical size of this matrix's existing weights (for a brand-new all-zero matrix: the same matrix in
+            another layer)"""
+            old = W if spec == "all" else (np.delete(W, spec[1], 1) if spec[0] == "cols" else np.delete(W, spec[1], 0))
+            r = float(np.sqrt((old ** 2).mean())) if old.size else 0.0
+            if r == 0.0:
+                suffix = name.split(".", 2)[2]
+                for other in sorted(n for n in g.T if n.endswith("." + suffix) and n != name):
+                    r = float(np.sqrt((g.deq(other) ** 2).mean()))
+                    if r:
+                        break
+            return r
+        for name, (spec, G) in m["exact"].items():
+            W = np.array(g.deq(name), dtype=np.float32); gr = float(np.sqrt((G ** 2).mean()))
+            if gr == 0.0:
+                continue
+            step = -(size * ref_rms(name, W, spec) / gr) * G   # RMS of the change = size x the typical weight
+            if spec == "all":
+                W += step
+            elif spec[0] == "cols":
+                W[:, spec[1]] += step
+            else:
+                W[spec[1], :] += step
+            edits[name] = W; changed += 1
     else:
-        raise ValueError("kind is 'gains' or 'lowrank'")
+        raise ValueError("kind is 'gains', 'lowrank' or 'exact'")
     del g
     try:
         path = write_model(edits, out, base=base)
     except AssertionError:   # tensor types that can't be overwritten in place: re-encode
         path = write_gguf(out, tensors=edits, base=base)
+    if os.path.exists(base + ".new.json"):   # a grown model: the map of its new parameters carries over
+        shutil.copyfile(base + ".new.json", path + ".new.json")
     return {"path": path, "kind": kind, "size": size, "changed": changed}
+
+
+def grow_mlp(out, extra=256, layers=None, init=1.0, base=None):
+    """Grow: `extra` new MLP neurons in `layers` (default all), written as a new GGUF. Their output weights start at
+    zero, so you behave exactly as before until you train them. Returns {"path", "new"}: `new` maps each new
+    parameter slice; train them with measure_gradient(examples, path=..., exact=new) and
+    gradient_step(m, out, kind="exact"). Also saved as <path>.new.json."""
+    from rsi.grow import widen_mlp
+    out = out if os.path.isabs(out) else os.path.join(WS, out)
+    new = widen_mlp(base or current_gguf(), out, extra=extra, layers=layers, init=init)
+    return {"path": out, "new": new}
+
+
+def grow_layers(out, after, n=1, copy_from=None, base=None):
+    """Grow: `n` new transformer layers after layer `after`, each a copy of a neighbour with its output matrices at
+    zero, so it passes its input through until trained. Later layers are renumbered. Returns {"path", "new"} (all
+    matrices of the new layers); train them with measure_gradient(..., exact=new) and gradient_step(kind="exact")."""
+    from rsi.grow import add_layers
+    out = out if os.path.isabs(out) else os.path.join(WS, out)
+    new = add_layers(base or current_gguf(), out, after=after, n=n, copy_from=copy_from)
+    return {"path": out, "new": new}
+
+
+def grown(path):
+    """the map of new parameters saved with a grown GGUF (or {})"""
+    try:
+        return json.load(open(path + ".new.json"))
+    except OSError:
+        return {}
 
 
 def doubt_direction(records, post_answer=True, path=None):
