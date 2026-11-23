@@ -18,7 +18,7 @@ from .loop import Session, create, models
 from . import settings
 
 ACC, WARN, GOOD, BAD, DIM = "#5fd7d7", "#ffd75f", "#87d787", "#ff8787", "grey58"
-STEPS = ["thinking", "research", "code", "build", "test", "switch", "plan"]
+STEPS = ["thinking", "research", "code", "build", "test", "waiting", "switch", "plan"]
 KIND = {"call": (ACC, "→ "), "result": ("#8a98a3", "  "), "model": ("#e6edf2", ""), "human": (WARN, "you: "), "note": (GOOD, "· ")}
 CSS = """
 Screen { background: #1b1e23; }
@@ -163,6 +163,11 @@ class Main(Screen):
             on_ = s_ == step
             line.append("● " if on_ else "○ ", ACC if on_ else DIM); line.append(s_ + "   ", f"bold {ACC}" if on_ else DIM)
         now = [line, Text(st.get("detail", ""), style="bold"), Text(f"now running as {st.get('model', '')}", style=DIM)]
+        jobs = self.s.read("state/jobs.json", {}) or {}
+        live_jobs = {n: j for n, j in jobs.items() if j.get("state") == "running"}
+        if live_jobs:
+            now += [Text(""), Text("background jobs", style=DIM)] + [
+                Text.assemble((f"● {n}", WARN), (f"  {int((time.time() - j.get('t0', time.time())) / 60)} min  {j['command'][:70]}", DIM)) for n, j in live_jobs.items()]
         runs = (self.s.read("state/test_runs.json", []) or [])[-4:]
         if runs:
             now += [Text(""), Text("latest tests", style=DIM)]

@@ -13,6 +13,7 @@ State lives in <folder>/.rsi/, the model's files in <folder>/workspace/. Setting
 import json, os, shutil, signal, subprocess, sys, time, traceback
 from . import llm, gguf_io, settings, tests
 from .tools import Toolbox, tool_list, ACTIVITY
+from .jobs import Jobs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLAYBOOK = os.path.join(ROOT, "rsi", "playbook.md")
@@ -202,6 +203,7 @@ class Loop:
         self.chat = self.s.read("state/chat.json", []) or []
         self.transcript = (self.s.read("live/transcript.json", {}) or {}).get("entries", [])
         self.cycle_k = 0; self.probation = None
+        self.jobs = Jobs(self)
 
     def reload(self):
         """settings are re-read at every step, so `rsi settings` changes apply to a running loop"""
@@ -345,6 +347,8 @@ class Loop:
         if not hist:
             opening += ("\nStart by deciding how to measure progress on the goal: write test suites in tests/ (see the playbook), "
                         "run them on yourself, and read what goes wrong. Ready-made suites are in tests/library/.\n")
+        if self.jobs.running():
+            opening += f"\nBackground jobs still running: {', '.join(self.jobs.running())}.\n"
         opening += "\nWorkspace:\n" + tb.t_list_files()[:3000]
         self.chat.append({"role": "user", "content": opening}); self._save_chat()
         self.note("note", f"cycle {k} begins" + (f": {direction['text']}" if direction else ""))
@@ -360,6 +364,8 @@ class Loop:
                 if t:
                     self.chat.append({"role": "user", "content": f"Message from the human: {t}"}); self.note("human", t)
             seen = len(box)
+            for name, j in self.jobs.poll():   # background jobs that ended since the last step
+                self.chat.append({"role": "user", "content": "[loop] " + self.jobs.summary(name, j)}); self.note("note", f"job {name} {j['state']}")
             if step and step % 60 == 0 and not c.get("max_steps"):
                 self.chat.append({"role": "user", "content": f"[loop] {step} tool calls so far this cycle. When you have tested and decided, call finish."})
             step += 1
@@ -435,6 +441,7 @@ class Loop:
         open(self.s.p("loop.pid"), "w").write(str(os.getpid()))
 
         def term(*_):
+            self.jobs.stop_all()
             try:
                 self.status(len(self.s.history()), "stopped", "the loop was stopped"); os.unlink(self.s.p("loop.pid"))
             except Exception:  # noqa: BLE001

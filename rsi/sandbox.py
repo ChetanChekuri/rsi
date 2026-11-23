@@ -22,9 +22,9 @@ def _gpu_devices():
                         "/dev/nvidia-uvm-tools", "/dev/nvidia-modeset", "/dev/dri", "/dev/kfd") if os.path.exists(d)]
 
 
-def run_in_workspace(workspace, argv, timeout=3600, mem="4G", cpu_quota=None, internet=True, local=False, isolate=True,
-                     ollama_url="http://127.0.0.1:11434", gate_dir=None, env=None):
-    """Run argv with the workspace as its home. Returns (exit code, combined output). timeout None/0 = no limit."""
+def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=False, isolate=True,
+            ollama_url="http://127.0.0.1:11434", gate_dir=None, env=None):
+    """-> (cmd, env for subprocess or None, cwd): argv wrapped in the sandbox with the workspace as its home"""
     ws = os.path.realpath(workspace); os.makedirs(os.path.join(ws, ".pkgs"), exist_ok=True)
     venv = os.path.realpath(os.path.dirname(os.path.dirname(sys.executable)))
     pyroot = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
@@ -68,6 +68,12 @@ def run_in_workspace(workspace, argv, timeout=3600, mem="4G", cpu_quota=None, in
         props = (["-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0"] if mem else []) + (["-p", f"CPUQuota={cpu_quota}"] if cpu_quota else [])
         if props:
             cmd = ["systemd-run", "--user", "--scope", "-q"] + props + cmd
+    return cmd, run_env, ws
+
+
+def run_in_workspace(workspace, argv, timeout=3600, **kw):
+    """Run argv in the sandbox and wait. Returns (exit code, combined output). timeout None/0 = no limit."""
+    cmd, run_env, ws = command(workspace, argv, **kw)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout or None, stdin=subprocess.DEVNULL,
                            cwd=ws, env=run_env)
@@ -75,3 +81,11 @@ def run_in_workspace(workspace, argv, timeout=3600, mem="4G", cpu_quota=None, in
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="ignore") if isinstance(e.stdout, bytes) else (e.stdout or "")
         return -1, out + f"\n[killed: exceeded the {timeout}s time limit]"
+
+
+def start_in_workspace(workspace, argv, log_path, **kw):
+    """Start argv in the sandbox without waiting (a background job); output goes to log_path. Returns the Popen.
+    The job dies with the loop (bubblewrap's --die-with-parent; a new session otherwise, killed by the loop)."""
+    cmd, run_env, ws = command(workspace, argv, **kw)
+    log = open(log_path, "ab", buffering=0)
+    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=ws, env=run_env, start_new_session=True)

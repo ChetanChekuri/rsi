@@ -6,6 +6,7 @@
   ollama_create              turn a GGUF it built, or an existing model plus Modelfile lines (parameters, system
                              prompt, template, LoRA adapter), into a runnable model
   ollama_list / ollama_delete
+  start_job / job_status / job_log / stop_job / wait    long work in the background (training, big runs)
   run_tests                  run one of its test suites on any models, with settings it picks
   switch_model               become one of the models it built (the conversation carries over)
   finish                     end the cycle: summary, plans, pick
@@ -27,6 +28,13 @@ CODE_TOOLS = [
     _fn("read_file", "Read a text file from your workspace.", {"path": S}, ["path"]),
     _fn("write_file", "Write a text file in your workspace (creates folders).", {"path": S, "content": S}, ["path", "content"]),
     _fn("list_files", "List files in your workspace (sizes in MB).", {"path": S}, []),
+    _fn("start_job", "Start a long shell command in the background (training, data generation, big conversions) in the same "
+        "sandbox as run_shell, with no time limit. You keep working; when it ends you are told, with its last output lines.",
+        {"name": S, "command": S}, ["name", "command"]),
+    _fn("job_status", "List your background jobs: running, done, failed, stopped.", {}, []),
+    _fn("job_log", "The last lines of a job's output.", {"name": S, "lines": I}, ["name"]),
+    _fn("stop_job", "Stop a running background job.", {"name": S}, ["name"]),
+    _fn("wait", "Wait (up to `minutes`) until a background job ends or the human writes, instead of polling.", {"minutes": I}, ["minutes"]),
 ]
 MODEL_TOOLS = [
     _fn("ollama_create", "Register a runnable model. Give gguf_path (a GGUF you built in your workspace) and/or modelfile "
@@ -52,7 +60,8 @@ def tool_list(cfg):
     return CODE_TOOLS + (research.TOOLS if cfg.get("research", True) else []) + MODEL_TOOLS
 
 
-ACTIVITY = {"run_python": "code", "run_shell": "code", "read_file": "code", "write_file": "code", "list_files": "code",
+ACTIVITY = {"run_python": "code", "run_shell": "code", "read_file": "code", "write_file": "code", "list_files": "code", "start_job": "code", "job_status": "code",
+            "job_log": "code", "stop_job": "code", "wait": "waiting",
             "web_search": "research", "arxiv_search": "research", "fetch_page": "research", "ollama_create": "build",
             "ollama_list": "build", "ollama_delete": "build", "run_tests": "test", "switch_model": "switch", "finish": "plan"}
 
@@ -144,6 +153,37 @@ class Toolbox:
             if len(rows) > 400:
                 rows.append("…"); break
         return "\n".join(rows) or "(empty)"
+
+    # ---------------------------------------------------------------- background jobs
+    def t_start_job(self, name, command):
+        return self.L.jobs.start(name, command, self.k)
+
+    def t_job_status(self):
+        self.L.jobs.poll()
+        t = self.L.jobs.table()
+        return json.dumps({n: {k: j.get(k) for k in ("state", "command", "started", "minutes", "exit_code", "log")} for n, j in t.items()},
+                          indent=1) if t else "no jobs yet"
+
+    def t_job_log(self, name, lines=60):
+        out = self.L.jobs.tail(name, min(int(lines or 60), 400))
+        return f"no job named {name}" if out is None else (out or "(no output yet)")
+
+    def t_stop_job(self, name):
+        return self.L.jobs.stop(name)
+
+    def t_wait(self, minutes=10):
+        if not self.L.jobs.running():
+            return "no jobs are running"
+        end = time.time() + max(1, min(int(minutes or 10), 24 * 60)) * 60; inbox = len(self.L._inbox())
+        self.L.status_activity("waiting", "waiting for " + ", ".join(self.L.jobs.running()))
+        while time.time() < end:
+            ended = self.L.jobs.poll()
+            if ended:
+                return "\n\n".join(self.L.jobs.summary(n, j) for n, j in ended)
+            if len(self.L._inbox()) > inbox:
+                return "the human sent a message (you'll see it next)"
+            time.sleep(5)
+        return f"still running after {minutes} min: {', '.join(self.L.jobs.running())}"
 
     # ---------------------------------------------------------------- models
     def t_ollama_create(self, name, gguf_path=None, modelfile=None, from_model=None):

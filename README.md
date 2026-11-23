@@ -62,6 +62,7 @@ cycle so far.
 |---|---|
 | `run_python`, `run_shell` | any code in the workspace: numpy, torch, gguf, `rsi_lib`; `pip install`; internet; GPU |
 | `read_file`, `write_file`, `list_files` | files in the workspace |
+| `start_job`, `job_status`, `job_log`, `stop_job`, `wait` | long work (training, data generation) in the background, with no time limit; the model keeps working and is told when a job ends |
 | `web_search`, `arxiv_search`, `fetch_page` | research (TinyFish, arXiv); pages are treated as untrusted text |
 | `ollama_create` | register a model: a GGUF it built and/or Modelfile lines (PARAMETER, SYSTEM, TEMPLATE, ADAPTER) on top of a model |
 | `ollama_list`, `ollama_delete` | its models; it can only delete models it made, never its current self |
@@ -84,7 +85,8 @@ By default code runs under bubblewrap in a systemd scope:
 - **Ollama:** code can run and inspect any model through a door that allows chat, generate, embed, show and list.
   Creating and deleting models only goes through the tools, which keep track of which models the loop made, so your
   other models are safe.
-- Memory, CPU and time per run are capped (configurable).
+- Memory, CPU and time per run are capped (configurable). Background jobs have no time limit; they run until they
+  finish, are stopped, or the loop stops.
 
 `rsi settings` can switch internet off, give code the local network too, or turn isolation off entirely (code then
 runs as you, with access to everything).
@@ -98,7 +100,7 @@ next step.
 |---|---|
 | Ollama | inference server, admin server (creates/deletes models), keep-alive |
 | Main model | thinking (on/off/low/medium/high), thinking budget (tokens per reply), context window, temperature, tool calls and minutes per cycle (0 = no limit), continue on its own or wait for you, test before switching, web research tools |
-| Sandbox | isolation, internet, local network, memory cap, CPU cap, time limit per run |
+| Sandbox | isolation, internet, local network, memory cap, CPU cap, time limit per run, background jobs at once, memory cap per job |
 | Tests (defaults) | thinking, token budget, tool rounds, parallel problems |
 | Models | how many models it may keep at once |
 
@@ -151,6 +153,7 @@ rsi/tools.py        the model's tools          rsi/tests.py     test suites, run
 rsi/settings.py     rsi settings               rsi/playbook.md  what the model reads (tools, method, findings)
 rsi/sandbox.py      where its code runs        rsi/netgate.py   the sandbox's internet proxy and ollama door
 rsi/app.py          the screen                 rsi_lib/         helpers importable in its code
+rsi/jobs.py         background jobs
 rsi/arch_qwen35.py  layer-streaming forward pass over a GGUF (~1 GB resident even for 27B)
 rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions       rsi/detectors.py  failure patterns in a trace
