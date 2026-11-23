@@ -203,6 +203,41 @@ Editing
   them (temperature, top_k, top_p, min_p, presence_penalty, repeat_penalty): test under the settings you'll be used
   with, and consider fixing bad defaults with a Modelfile PARAMETER line instead of a weight edit.
 
+Capabilities (coding, math, knowledge, writing) and the parameters behind them
+- **Each capability rests on a small set of MLP neurons you can find in minutes.** Run a capability's examples and
+  a few other capabilities' examples; at the positions where the answer is produced, take each neuron's mean |activation|
+  per capability; rank neurons by the share of their activation that falls on the target capability (ignoring
+  neurons that are barely active on it). Zeroing the top ~0.1% of neurons (their ffn_down columns) broke that
+  capability and left the others untouched; random neurons did nothing. [ours, both] (examples: math 69% -> 19% and
+  54% -> 4% exact answers; code, facts and creative writing each hurt only themselves.) Use ablation of such a set as
+  the check that you have found what a capability depends on.
+- **Capabilities lean on different parts.** Knowledge was hit hardest by removing middle-to-late MLPs; arithmetic by
+  a few specific attention layers plus MLPs; code and creative writing were spread out, with no single middle part
+  mattering much. [ours, one model; consistent with lit: facts stored in MLPs, arithmetic routed by attention]
+- **Necessary is not the same as improvable.** Amplifying a capability's neurons (scale their ffn_down columns) is a
+  gamble: on one model, ~500 math-specific neurons x1.5 raised generated arithmetic 28 -> 35/60 (+7/-0; the same
+  edit on random neurons: 28/60) with no loss on facts or code; on the other model the same recipe barely beat random
+  and hurt unseen formats. Only about half of a capability's specific neurons push toward right answers, which is why
+  blind amplification is hit or miss. [ours, both] Amplifying the neurons most *active* on a capability (not
+  specific to it) hurt every capability. Gains peak at modest gains (x1.25-1.5); x2 was worse. Selection needs
+  enough examples: 16 build examples gave nothing, 96 worked.
+- **When it works, it is self-gating.** Capability-specific neurons are quiet on other inputs, so editing them
+  changes the target capability and almost nothing else; generic neurons have no such gate. Prefer edits confined
+  to specific parts over model-wide edits. [ours, both]
+- **You improve the skill your examples exercise, not the whole capability.** Neurons chosen on short arithmetic
+  answers improved arithmetic (including formats never seen in selection) but not multi-step word problems (15 vs
+  13/30). Choose neurons from the behaviour you want to change (ideally the positions where the capability fails)
+  and test on the real task. [ours]
+- **Amplification can't create knowledge.** Boosting fact-specific neurons never improved facts. Knowledge gaps
+  need new information (data, retrieval, tools), not gain changes. [ours; consistent with lit]
+- **Capabilities share parts and compete.** Boosting code neurons cost math; boosting creative-writing neurons
+  cost facts. Always measure the other capabilities after a capability edit. [ours]
+- **Fit an edit in the format it will be used in; local signals are fragile.** Setting each neuron's gain from a
+  local signal (does raising it lower the answer's loss read through the vocabulary at that layer?) beat blind
+  amplification on both models in the format it was fitted on (math 57% -> 75%, unseen formats 86% -> 95%; 54% ->
+  71%), but did nothing in chat-style generation, and refitting it on chat-formatted questions made things worse:
+  the local signal ignores what later layers do. Judge every candidate by generated answers in the real format. [ours, both]
+
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
 S = stream()                                   # verify it with check_stream() first

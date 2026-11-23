@@ -120,6 +120,11 @@ and Wikipedia.
   generated reasoning *worse* at strength 0.5 (78% → 65%) and no better at 0.25 (73% vs 71% on 180 items, p=0.49).
   Rating good reasoning as likely is not the same as producing it.
 
+- Capabilities sit in small neuron sets: zeroing ~0.1% of MLP neurons chosen by how specific their activation is to
+  a capability broke only that capability (math 69% -> 19% on Llama-3.2-1B, 54% -> 4% on Qwen3.5-0.8B). Amplifying
+  them is hit or miss: +7/-0 on generated arithmetic for Llama (random neurons: no change), little on Qwen, nothing
+  for knowledge or multi-step word problems.
+
 These findings are in the playbook the model reads. A 0.8B model is too weak to run the loop well (it writes poor
 tests and loses track of its tools); the loop is meant for much stronger models.
 
