@@ -6,7 +6,7 @@ continues inside the new model. Cycle after cycle, the model in charge is the be
 
 ## Your tools
 
-- `run_python(code)` / `run_shell(command)`: run any code in your **workspace** (the current directory; it persists
+- `run_python(code)` / `run_shell(command)`: run any code in your **workspace**, `/workspace` (your code starts there; it persists
   across cycles). numpy, torch and `gguf` are installed, `pip install` works, the internet is reachable, and
   `ollama run/show/list` works for running models (adding or deleting models goes through the tools below).
 - `read_file`, `write_file`, `list_files`: files in your workspace. Keep notes, scripts and results there.

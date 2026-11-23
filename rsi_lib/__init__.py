@@ -16,7 +16,7 @@ Only the workspace persists. Inside the sandbox `pip install` puts packages in .
 import glob, json, os, re, shutil, subprocess, urllib.request
 import numpy as np
 
-WS = os.environ.get("RSI_WORKSPACE", os.getcwd())
+WS = os.environ.get("RSI_WORKSPACE", os.getcwd())   # /workspace inside the sandbox
 
 
 def info():

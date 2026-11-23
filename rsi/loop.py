@@ -297,7 +297,7 @@ class Loop:
         return (open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{c['goal']}\n\n# Where you are now\n\n"
                 f"- You are `{self.tag}` (generation {self.lineage['current']}; base model `{c['model']}`).\n"
                 f"- Your weights: `{self.gguf_of(self.tag)}` (read-only). Editable master: `{self.gguf_of(c['master_tag'])}`.\n"
-                f"- Your workspace (the current directory of your code, and where tool paths are relative to; `/workspace` also points to it): `{self.workspace}`. "
+                f"- Your workspace is `/workspace`: your code starts there, and file tool paths are relative to it. "
                 f"Test suites go in `tests/<name>/`; ready-made ones are in `tests/library/`.\n"
                 f"- Hardware: {self.hw['label']}. Code runs in {walls}, {net}"
                 + (f", memory cap {c['sandbox_mem']}" if c.get("sandbox_mem") else "") + ".\n"
@@ -310,7 +310,11 @@ class Loop:
 
     def _trim(self, msgs):
         """fit the conversation in the context window: shorten old tool results, then drop the oldest turns"""
-        budget = int(self.cfg["num_ctx"]) * 3
+        # the window holds the system prompt, the tool schemas, the conversation AND the reply: leave room for all of
+        # them, or ollama silently cuts the start of the prompt (the system prompt goes first). ~3 characters per token.
+        fixed = len(self.system_prompt()) + len(json.dumps(tool_list(self.cfg)))
+        room = int(self.cfg["num_ctx"]) - int(self.cfg["pilot_num_predict"]) - fixed // 3 - 512
+        budget = max(room, 1500) * 3
         msgs = [dict(m) for m in msgs]
         size = lambda ms: sum(len(str(m.get("content", ""))) + len(json.dumps(m.get("tool_calls", ""))) for m in ms)
         for m in msgs[:-8]:

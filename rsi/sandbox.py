@@ -28,9 +28,10 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
     ws = os.path.realpath(workspace); os.makedirs(os.path.join(ws, ".pkgs"), exist_ok=True)
     venv = os.path.realpath(os.path.dirname(os.path.dirname(sys.executable)))
     pyroot = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
-    base_env = {"HOME": ws, "RSI_WORKSPACE": ws, "PYTHONPATH": f"{ROOT}:{ws}/.pkgs", "PIP_TARGET": f"{ws}/.pkgs",
+    w = "/workspace" if isolate else ws   # inside the sandbox the workspace is /workspace (what models expect)
+    base_env = {"HOME": w, "RSI_WORKSPACE": w, "PYTHONPATH": f"{ROOT}:{w}/.pkgs", "PIP_TARGET": f"{w}/.pkgs",
                 "PIP_BREAK_SYSTEM_PACKAGES": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-                "PATH": f"{venv}/bin:{ROOT}/rsi/sbin:{ws}/.pkgs/bin:/usr/local/bin:/usr/bin:/bin",
+                "PATH": f"{venv}/bin:{ROOT}/rsi/sbin:{w}/.pkgs/bin:/usr/local/bin:/usr/bin:/bin",
                 "LANG": "C.UTF-8", "TERM": "dumb", **(env or {})}
     if not isolate:
         cmd = list(argv); run_env = dict(os.environ, **base_env)
@@ -45,7 +46,7 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
             b += ["--ro-bind", BLOBS, BLOBS]
         for d in _gpu_devices():
             b += ["--dev-bind", d, d]
-        b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", ws, "--clearenv"]   # /workspace: the usual alias
+        b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", "/workspace", "--clearenv"]   # also at its real path
         inner = list(argv)
         if local:
             base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1]

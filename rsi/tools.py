@@ -25,9 +25,10 @@ CODE_TOOLS = [
     _fn("run_python", "Run Python code in your workspace (the current directory). numpy, torch, gguf and `from rsi_lib import *` "
         "are available; `pip install` works. Returns stdout/stderr.", {"code": S, "timeout_s": I}, ["code"]),
     _fn("run_shell", "Run a shell command in your workspace (bash). curl, git, pip, ollama (run/show/list) work.", {"command": S, "timeout_s": I}, ["command"]),
-    _fn("read_file", "Read a text file from your workspace.", {"path": S}, ["path"]),
-    _fn("write_file", "Write a text file in your workspace (creates folders).", {"path": S, "content": S}, ["path", "content"]),
-    _fn("list_files", "List files in your workspace (sizes in MB).", {"path": S}, []),
+    _fn("read_file", "Read a text file from your workspace (/workspace). Paths are relative to it, e.g. tests/library/README.md.", {"path": S}, ["path"]),
+    _fn("write_file", "Write a text file in your workspace (/workspace; creates folders). Paths are relative to it, e.g. tests/tools/problems.jsonl.",
+        {"path": S, "content": S}, ["path", "content"]),
+    _fn("list_files", "List files in your workspace (/workspace), sizes in MB. Omit path for everything.", {"path": S}, []),
     _fn("start_job", "Start a long shell command in the background (training, data generation, big conversions) in the same "
         "sandbox as run_shell, with no time limit. You keep working; when it ends you are told, with its last output lines.",
         {"name": S, "command": S}, ["name", "command"]),
@@ -82,7 +83,7 @@ class Toolbox:
             path = path[len("/workspace"):].lstrip("/") or "."
         p = os.path.realpath(path if os.path.isabs(path) else os.path.join(self.ws, path))
         if not (p == os.path.realpath(self.ws) or p.startswith(os.path.realpath(self.ws) + os.sep)):
-            raise ValueError(f"{path} is outside your workspace ({self.ws}). Use paths relative to it, e.g. tests/library/README.md")
+            raise ValueError(f"{path} is outside your workspace (/workspace). Use paths relative to it, e.g. tests/library/README.md")
         return p
 
     def _owned(self):
@@ -116,6 +117,8 @@ class Toolbox:
         except Exception as e:  # noqa: BLE001
             out = f"error: {type(e).__name__}: {e}"
         out = str(out)
+        if self.cfg.get("sandbox_isolate", True):   # one name for the workspace everywhere the model looks
+            out = out.replace(os.path.realpath(self.ws), "/workspace").replace(self.ws, "/workspace")
         self.log.append({"tool": name, "args": {k: (v[:300] if isinstance(v, str) else v) for k, v in args.items()},
                          "seconds": round(time.time() - t0, 1), "result": out[:1500]})
         return out if len(out) <= 12000 else out[:6000] + f"\n…[{len(out) - 12000} characters cut]…\n" + out[-6000:]
