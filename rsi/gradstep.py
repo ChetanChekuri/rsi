@@ -92,7 +92,7 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
             else:
                 mg = lg[R, tg] - torch.logsumexp(lg, -1); obj = -mg.sum()
             obj.backward()
-            margins += [float(mg[rb == b].mean()) for b in range(B)]; hits += [float((lg.argmax(-1) == tg)[rb == b].float().mean()) for b in range(B)]
+            mg = mg.detach(); margins += [float(mg[rb == b].mean()) for b in range(B)]; hits += [float((lg.argmax(-1) == tg)[rb == b].float().mean()) for b in range(B)]
             with torch.no_grad():
                 per = {}
                 for (kind, l), xin, y, Wm in cap:
