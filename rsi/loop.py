@@ -297,7 +297,7 @@ class Loop:
         return (open(PLAYBOOK).read() + f"\n\n# Your goal (set by the human)\n\n{c['goal']}\n\n# Where you are now\n\n"
                 f"- You are `{self.tag}` (generation {self.lineage['current']}; base model `{c['model']}`).\n"
                 f"- Your weights: `{self.gguf_of(self.tag)}` (read-only). Editable master: `{self.gguf_of(c['master_tag'])}`.\n"
-                f"- Your workspace (the current directory of your code, and where tool paths are relative to): `{self.workspace}`. "
+                f"- Your workspace (the current directory of your code, and where tool paths are relative to; `/workspace` also points to it): `{self.workspace}`. "
                 f"Test suites go in `tests/<name>/`; ready-made ones are in `tests/library/`.\n"
                 f"- Hardware: {self.hw['label']}. Code runs in {walls}, {net}"
                 + (f", memory cap {c['sandbox_mem']}" if c.get("sandbox_mem") else "") + ".\n"

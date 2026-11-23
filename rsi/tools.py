@@ -77,9 +77,12 @@ class Toolbox:
 
     # ---------------------------------------------------------------- helpers
     def _inside(self, path):
+        path = str(path or ".")
+        if path == "/workspace" or path.startswith("/workspace/"):   # the usual convention: an alias for the workspace
+            path = path[len("/workspace"):].lstrip("/") or "."
         p = os.path.realpath(path if os.path.isabs(path) else os.path.join(self.ws, path))
         if not (p == os.path.realpath(self.ws) or p.startswith(os.path.realpath(self.ws) + os.sep)):
-            raise ValueError("only paths inside your workspace are allowed")
+            raise ValueError(f"{path} is outside your workspace ({self.ws}). Use paths relative to it, e.g. tests/library/README.md")
         return p
 
     def _owned(self):

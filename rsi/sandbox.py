@@ -45,7 +45,7 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
             b += ["--ro-bind", BLOBS, BLOBS]
         for d in _gpu_devices():
             b += ["--dev-bind", d, d]
-        b += ["--bind", ws, ws, "--chdir", ws, "--clearenv"]
+        b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", ws, "--clearenv"]   # /workspace: the usual alias
         inner = list(argv)
         if local:
             base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1]
