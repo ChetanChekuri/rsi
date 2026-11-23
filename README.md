@@ -133,15 +133,17 @@ Any model ollama runs can be the starting model. Reading and rewriting tensors, 
 for every architecture. The layer-streaming forward pass (activations, log-likelihoods) covers the Qwen3.5 / Qwen3.8
 family (`qwen35`, its own implementation) and the standard decoder family: llama, mistral, qwen2, qwen3, granite
 and similar (`rsi/arch_generic.py`, tokenizer built from the GGUF itself). `check_stream()` confirms a forward pass
-agrees with ollama's next-token predictions before it is trusted (3/3 on Qwen3.5-0.8B); for other architectures the
+agrees with ollama's next-token predictions before it is trusted (4/4 on Qwen3.5-0.8B and on Llama-3.2-1B, whose
+Llama 3 rope scaling and start token it handles); for other architectures the
 model can subclass it or write its own. For a quantized-only model, `rsi` uses a `-q8_0` / `-fp16` tag as the editable
 master when one exists; otherwise the model works on the quantized file and `write_gguf` re-encodes what it changes.
 The 0.8B runs on a laptop CPU; a 27B model needs a 24-48 GB GPU and plenty of disk (each GGUF-based model it builds
 is another full copy; `max_models` caps how many it keeps).
 
 The playbook also carries what is known about how weights map to behaviour (where outputs form, which layers are
-redundant, attention-sink dimensions, why magnitude isn't importance), measured on Qwen3.5-0.8B with short
-experiments, and a recipe for the model to map its own layers first.
+redundant, attention-sinks, why magnitude isn't importance, where and how to edit a behaviour), from the literature
+and short experiments on two different small models (Qwen3.5-0.8B and Llama-3.2-1B, marked where they agree), and a
+recipe for the model to map its own layers first.
 
 ## Install
 

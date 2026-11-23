@@ -18,6 +18,7 @@ from .edits import ops_for, apply_torch
 
 
 class Qwen35Stream:
+    bos = []   # Qwen adds no BOS token at a document start
     def __init__(self, gguf_path, tokenizer_path, device="auto", vgroup="interleave", base_dir="", lm_cache_gb=3.0):
         self.g = GGUF(gguf_path); m = self.g.meta
         self.L = int(m("block_count"))

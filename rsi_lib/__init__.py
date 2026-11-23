@@ -211,7 +211,8 @@ def n_layers(path=None):
 def stream(path=None, device="auto"):
     """a layer-streaming forward pass over a GGUF (activations, log-likelihoods; ~1 GB resident even for 27B).
     Qwen3.5/3.8: rsi/arch_qwen35.py. llama, mistral, qwen2, qwen3, granite...: rsi/arch_generic.py. Anything else:
-    write your own (subclass GenericStream). Verify a stream with check_stream() before trusting it."""
+    write your own (subclass GenericStream). Verify a stream with check_stream() before trusting it. Tokens:
+    S.bos + S.enc(text) (S.enc never adds the start token; models such as Llama 3 need it)."""
     from rsi.arch_generic import open_stream
     return open_stream(path or current_gguf(), device)
 

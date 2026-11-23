@@ -105,41 +105,51 @@ Matrices that write into the residual stream are each layer's `ssm_out`/`attn_ou
 ## How weights map to behaviour: general principles
 
 Labels: **[lit]** reported across many models in the research literature; **[ours]** seen in our own short
-experiments (so far on one hybrid-attention 0.8B model): treat these as hypotheses to check on yourself. Numbers in
+experiments on two small models of different design (Qwen3.5-0.8B, hybrid linear/full attention; Llama-3.2-1B,
+standard attention), marked "both" where the two agreed: treat these as hypotheses to check on yourself. Numbers in
 parentheses are worked examples, not facts about you.
 
 Where things happen
 - **Output forms late.** Reading each layer's residual through the output norm and vocabulary (the logit lens) shows
-  the final prediction taking shape only in the last part of the network. [lit] (example: under 6% agreement with
-  the final prediction until 2/3 of the depth, 55% one layer before the end.) Edits meant to change what you *say*
+  the final prediction taking shape only in the last part of the network. [lit + ours, both] (examples: under 10%
+  agreement with the final prediction until ~2/3 of the depth in both; 55% and 76% one layer before the end.) Edits meant to change what you *say*
   (wording, stopping, format) belong in the late layers; earlier layers hold more abstract features.
 - **Behaviours become word-shaped late and drift with depth.** A behaviour direction found from activations points
   at its typical words only in the later layers, and the direction measured at one layer agrees less and less with
-  farther layers. [ours] (example: neighbouring layers cosine ~0.85, six layers apart ~0.6.) When editing several
+  farther layers. [ours, both] (examples: neighbouring layers cosine 0.7-0.85; a quarter of the depth apart ~0.5.) When editing several
   layers, take a direction per layer or per small group, not one direction everywhere.
 - **A few parts matter far more than the rest.** Removing single layers costs very unequal amounts; the first and
   last layers and a handful of middle ones (often full-attention layers in hybrid models) carry most of the load.
-  [lit + ours] Within a layer, which half does the work (attention-type mixer or MLP) changes from layer to layer.
+  [lit + ours, both] (example: removing layer 0 or 1 of a 16-layer model cost +7.5 / +4.8 nats per token, any
+  middle layer 0.05-0.4, the last 0.56.) Within a layer, which half does the work (attention-type mixer or MLP) changes from layer to layer.
 - **Behaviours tied to context can live in the attention-type writers, not the MLPs.** Removing a "second-guessing"
   direction from the mixer outputs suppressed it; removing it from the MLP outputs did nothing. [ours, small n] Try
   mixer-only and MLP-only versions of an edit before assuming MLPs hold behaviours.
 
 What is (and isn't) important
-- **Magnitude is not importance.** Some residual dimensions are huge but carry almost no information (they can be
-  set to a constant or zeroed with no effect); others are small and essential. Rank parts by what removing them
-  does, never by size. [lit + ours]
+- **Magnitude is not importance.** Some residual dimensions are huge but carry almost no information: they can be
+  set to a constant (their typical value) with no effect, while small dimensions can be essential. Rank parts by
+  what removing them does, never by size. [lit + ours, both] But "carries no information" is not "can be deleted":
+  see the next point.
 - **Massive activations and attention sinks.** Many models write a few giant, input-independent values (usually on
-  the first token) that act as fixed biases / attention sinks; in some models a single "super weight" in an early
-  MLP creates them and zeroing it destroys the model. [lit] Hybrid or gated-attention models may have much weaker
-  ones, but even a weak sink can matter (example: removing it cost 8%, flipping it 19%). Find yours before editing
-  early layers, and leave whatever writes it alone.
+  the first token) that act as fixed biases / attention sinks; an early MLP creates them, sometimes through a single
+  "super weight". [lit] They are a redundant set: setting them to their usual values is harmless, zeroing any one of
+  them did nothing, zeroing all of them wrecked the model. [ours] (example, standard-attention 1B: four dims ~400x
+  the median, all written by one MLP neuron in layer 1; mean value +0.00, zero one +0.00, zero all four +12 nats per
+  token, flip sign +3.6; zero that neuron +1.2 vs +0.0002 for a random neuron; its single largest weight alone,
+  nothing.) Hybrid or gated-attention models may have much weaker sinks, but even a weak one can matter (example:
+  removing it cost 8%). Find yours before editing early layers, leave whatever writes it alone, and test removals as
+  a group, because redundancy hides importance one part at a time.
 - **Cheap similarity tests are weak guides.** "Layers whose output ≈ input are redundant" (cosine-based block
-  influence) works on some models [lit] but predicted removal cost poorly on ours (r = 0.36). Measuring the loss with a
+  influence) works on some models [lit] but predicted removal cost poorly on ours [both] (r = 0.36; on the other,
+  rank correlation 0.19 overall and negative among the middle layers). Measuring the loss with a
   layer removed takes one forward pass per layer: do that instead.
 
 Editing
 - **Direction matters, not size.** Random changes of several percent of a matrix's norm barely move the model;
-  small changes aligned with something the model uses move it a lot. [ours; consistent with lit on low-rank edits]
+  small changes aligned with something the model uses move it a lot. [ours, both; consistent with lit on low-rank
+  edits] (example: a rank-1 edit of 1.5% of a matrix's norm along a behaviour direction moved the behaviour by 0.30
+  nats; the same-size edit along a random direction by 0.01, random noise of 5% by 0.01.)
   Judge an edit's risk by what it is aligned with, and test aligned edits on behaviour.
 - **Behaviours aren't the top singular directions of single weight matrices**, and reading weights through the
   vocabulary doesn't find them reliably. Find behaviour directions from activation differences on real traces.
@@ -152,19 +162,25 @@ Editing
   the whole writer edit. Reader edits recover much of the gap as a plain weight change: for every matrix W that
   reads the normed residual (gain g), W <- W - a (W (g*r)) (r/g)^T removes what it sees along unit direction r
   (3.1 nats over the same layers; 4.0 when the output head also ignores r, which needs an untied output.weight,
-  e.g. added with write_gguf). But strength costs selectivity: on general text the writer edit added +0.006
-  nats/token, the reader edit +0.031 and the activation edit +0.056, so per unit of collateral damage the writer
-  edit was ~3x more selective (other uses of the direction are also read downstream). Start with writer edits;
-  move to reader edits only when you need a stronger change, and compare candidates at matched effect. [ours,
-  likelihood at real decision points + general loss; the accumulation argument holds for any residual network]
-- **Edit just after a behaviour becomes word-shaped; use the last layer only for strength.** One-layer writer edits
-  (each layer's own direction): before the behaviour is readable through the vocabulary, nothing happens; in the
-  layers just after it becomes readable, the behaviour drops and general loss *improves slightly*; the final layer
-  gives the largest drop but is the least selective, because it writes the output directly. Find the layer where the
-  logit lens first sees the behaviour, and start editing there. [ours]
+  e.g. added with write_gguf). The order writer < reader < activation held on both models [both] (second model:
+  0.31 < 0.80 < 1.52 nats). What the extra strength costs depends on the direction: for a direction with other uses
+  (second-guessing, entangled with ordinary reasoning) general loss rose +0.006 / +0.031 / +0.056, so the writer edit
+  was ~3x more selective; for a direction with no other job on the general text (answering in another language)
+  none of the three raised general loss at all. Measure the collateral cost of each candidate on general text
+  instead of assuming it, and compare candidates at matched effect. [ours, likelihood at real decision points +
+  general loss; the accumulation argument holds for any residual network]
+- **Edit where the behaviour's direction has formed; use the last layer only for strength.** One-layer writer edits
+  (each layer's own direction): in early layers nothing happens; from the layer where the direction becomes
+  consistent across depth (its cosine with later layers' directions jumps), the behaviour drops while general loss
+  stays flat or *improves slightly*; the final layer is the least selective, because it writes the output directly.
+  [ours, both] The onset can come well before the direction is readable through the vocabulary (example: edits
+  worked from layer 8 of 16, the direction pointed at the behaviour's words only from layer 13; on the other model
+  the two coincided). To find the onset, compute a direction per layer and look where neighbouring directions start
+  agreeing, then confirm with one-layer edits; don't wait for the logit lens to see it.
 - **Edits along functional directions survive quantization.** A rank-1 behaviour edit kept its full effect after
-  re-quantizing from 8-bit to 4-bit (-9.9 vs -10.6 nats on the targeted word): quantization noise acts like a random
-  edit, which barely matters. Edit a high-precision master and quantize afterwards. [ours]
+  re-quantizing from 8-bit to 4-bit (-9.9 vs -10.6 nats on the targeted word; on the other model -0.30 float,
+  -0.30 at 8-bit, -0.31 at 4-bit): quantization noise acts like a random edit, which barely matters. Edit a
+  high-precision master and quantize afterwards. [ours, both]
 - **Spectral health doesn't detect edits that matter.** The heavy-tail exponent of a matrix's spectrum is a rough
   sign of how trained it is [lit], but useful rank-1 edits leave it unchanged. [ours] It can't replace testing.
 - **Repeating or skipping layers is not free.** Some middle layers can be repeated or removed cheaply, late layers
@@ -190,7 +206,7 @@ Editing
 How to measure your own model's map (do this first on a new model; each step takes seconds to minutes):
 ```python
 S = stream()                                   # verify it with check_stream() first
-seqs = [S.enc(t) for t in some_texts]
+seqs = [S.bos + S.enc(t) for t in some_texts]   # S.bos: the start token, if your model uses one
 acts = S.run(seqs, capture=[{"pos": list(range(len(s)))} for s in seqs])[0]["pos"]   # {layer: (tokens, D)}
 # removal cost: replace S.block for layer l with `lambda l, x, W: x` and compare S.run(..., score=[{"nll": ...}])
 # massive dims: |acts[l]| hundreds of times the median, usually on the first token: don't touch their writers

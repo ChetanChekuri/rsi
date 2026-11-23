@@ -3,6 +3,7 @@ qwen3, granite, ...: RMSNorm, rotary attention with grouped KV heads, gated MLP)
 GGUF, and a way to open the right one for any model file.
 
     S = open_stream(gguf_path)        # Qwen35Stream for qwen35, GenericStream for the llama family
+    ids = S.bos + S.enc(text)         # S.enc never adds BOS; models like Llama 3 need it (S.bos) or they go off track
     check_stream(S, model_tag)        # does it predict the same next token as ollama? (verify before trusting it)
 """
 import json, os, re, urllib.request
@@ -60,8 +61,14 @@ class GenericStream(Qwen35Stream):
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dev = torch.device(device); self.wdt = torch.float16 if self.dev.type == "cuda" else torch.float32
         self.tok = tokenizer if tokenizer is not None else gguf_tokenizer(gguf_path)
+        add_bos, bos_id = field(self.g, "tokenizer.ggml.add_bos_token"), field(self.g, "tokenizer.ggml.bos_token_id")
+        if add_bos is None:   # llama.cpp's default: BPE vocabularies get a BOS unless they say otherwise (Qwen: no)
+            add_bos = bos_id is not None and "qwen" not in str(field(self.g, "tokenizer.ggml.pre", ""))
+        self.bos = [int(bos_id)] if add_bos and bos_id is not None else []   # prefix S.bos + S.enc(text) for a document start
         self.vgroup, self.base_dir, self.lm_cache_gb = "interleave", base_dir, lm_cache_gb
         self.inv = 1.0 / (self.theta ** (torch.arange(0, self.rd, 2, dtype=torch.float64, device=self.dev) / self.rd))
+        if "rope_freqs.weight" in self.g.T:   # per-frequency divisors (Llama 3.1+ long-context scaling)
+            self.inv = self.inv / torch.tensor(np.array(self.g.deq("rope_freqs.weight")), dtype=torch.float64, device=self.dev).flatten()[: self.rd // 2]
         self.lm_name = "output.weight" if "output.weight" in self.g.T else "token_embd.weight"
         self._lm = None; self.rec = [False] * self.L
         if any(n.endswith("ffn_gate_exps.weight") for n in self.g.T):
@@ -109,13 +116,17 @@ def open_stream(gguf_path, device="auto"):
     return GenericStream(gguf_path, device=device)
 
 
-def check_stream(S, model_tag, prompts=("The capital of France is", "def add(a, b):\n    return", "1, 2, 3, 4,"),
+def check_stream(S, model_tag, prompts=("The capital of France is", "def add(a, b):\n    return", "The opposite of hot is",
+                                        "The answer to 7 times 8 is"),
                  host=os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")):
     """Does the forward pass agree with ollama? For each prompt: the stream's most likely next token vs the token
-    ollama generates at temperature 0 (raw prompt, no template). Returns (agreed, total, details)."""
+    ollama generates at temperature 0 (raw prompt, no template). Returns (agreed, total, details). A rare mismatch can be
+    a near-tie that ollama's quantized arithmetic flips: compare the two tokens' log-probs before suspecting a bug.
+    Ollama's raw mode can also handle some prompts differently (on Qwen3.5, some prompts ending in a newline + text), so
+    keep the test prompts plain."""
     res = []
     for p in prompts:
-        ids = S.enc(p)   # one placeholder token after the prompt: its "prediction" is the stream's next-token guess
+        ids = getattr(S, "bos", []) + S.enc(p)   # ollama adds the model's BOS to raw prompts too; one placeholder token after the prompt: its "prediction" is the stream's next-token guess
         out = S.run([ids + [ids[-1]]], score=[{"argmax": (len(ids), len(ids) + 1)}])[0]["argmax"][0]
         mine = S.tok.decode([int(out[-1])])
         body = {"model": model_tag, "prompt": p, "raw": True, "stream": False, "options": {"temperature": 0, "num_predict": 1, "seed": 0}}
@@ -123,5 +134,5 @@ def check_stream(S, model_tag, prompts=("The capital of France is", "def add(a, 
         r = json.loads(urllib.request.urlopen(urllib.request.Request(host_url + "/api/generate", json.dumps(body).encode(),
                                                                      {"Content-Type": "application/json"}), timeout=600).read())
         theirs = r.get("response", "")
-        res.append({"prompt": p, "stream": mine, "ollama": theirs, "agree": mine.strip() == theirs.strip() and mine != ""})
+        res.append({"prompt": p, "stream": mine, "ollama": theirs, "agree": mine == theirs and mine != ""})
     return sum(r["agree"] for r in res), len(res), res
