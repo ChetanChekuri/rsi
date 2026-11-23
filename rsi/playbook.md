@@ -248,8 +248,15 @@ Reasoning, and gradients as a measuring tool
   definitions were shuffled (0/8; 7/8 at 4 steps). Ordering people from shuffled comparisons collapsed the same
   way (6/8 with 2 comparisons, 1/8 with 4, 0/8 with 8), and chaining if-then rules with conditions stayed at chance.
   Asking it to reorder first barely helped (2/8): putting the pieces in order is the hard part. A small model
-  trained to think at length did assemble shuffled 8-step chains (3/3), spending ~1,900 tokens each, but ran out
-  of a 3,000-token budget on the rule problems without answering. [ours]
+  trained to think at length did assemble shuffled 8-step chains (3/3, ~1,900 tokens each) and did better on the
+  8-step rule problems than the 1B without thinking (7/11 vs chance). [ours]
+- **Give thinking room, then cap it.** A thinking model's "unfinished" answers were the 4,096-token default context
+  (ollama's num_ctx) filling up, not a lack of budget: with a 16k context 10 of 11 rule problems finished within
+  ~3,700 tokens. One never would: it repeated the same block word for word. Closing the thinking at a fixed budget
+  and asking for the answer did as well as letting it finish (8/11 forced at ~1,700 or ~2,500 tokens vs 7/11
+  finished; 6/11 with no thinking or ~800 tokens), and also cashes out loops. Check the context window first, find
+  the budget where forced answers stop improving, and cap thinking there. [ours, one model, 11 problems; lit:
+  budget forcing]
 - **Tools help when the problem translates literally into code.** Writing a program solved ordered and shuffled
   chains that prose reasoning failed (8-step shuffled: 2/8 by program vs 0/8), but did nothing for ordering or rules
   (1/12 each): the model could not encode the relations. [ours, one model]
