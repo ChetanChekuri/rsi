@@ -236,13 +236,34 @@ class _Text(HTMLParser):
             self.parts.append(d.strip())
 
 
-def fetch_page(url, max_chars=6000):
-    if not url.startswith(("http://", "https://")):
-        return "only http(s) URLs can be fetched"
+class _PublicOnly(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_public(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _check_public(url, allow_local=False):
+    """fetch_page runs outside the sandbox: never let it reach this machine or the local network (unless the sandbox
+    itself may: the "Local network" setting)"""
+    from .netgate import public_address
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("only http(s) URLs can be fetched")
+    if not allow_local and not public_address(u.hostname, u.port or (443 if u.scheme == "https" else 80)):
+        raise ValueError(f"{u.hostname} is not a public internet address")
+
+
+def fetch_page(url, max_chars=6000, allow_local=False):
+    try:
+        _check_public(url, allow_local)
+    except ValueError as e:
+        return f"refused: {e}"
     t = tinyfish_fetch(url, max_chars)
     if t:
         return t
-    ctype, raw = _get(url)
+    opener = urllib.request.build_opener(*([] if allow_local else [_PublicOnly]))
+    with opener.open(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=25) as r:
+        ctype, raw = r.headers.get("Content-Type", ""), r.read(2_000_000)
     if "pdf" in ctype.lower():
         return "(this is a PDF; read its abstract page instead, e.g. https://arxiv.org/abs/<id>)"
     p = _Text(); p.feed(raw.decode("utf-8", "ignore"))
@@ -260,14 +281,14 @@ TOOLS = [
 ]
 
 
-def execute(name, args):
+def execute(name, args, allow_local=False):
     try:
         if name == "web_search":
             res = web_search(str(args.get("query", "")), kind=str(args.get("kind") or "web"))
         elif name == "arxiv_search":
             res = arxiv_search(str(args.get("query", "")))
         elif name == "fetch_page":
-            return UNTRUSTED + fetch_page(str(args.get("url", "")))
+            return UNTRUSTED + fetch_page(str(args.get("url", "")), allow_local=allow_local)
         else:
             return f"unknown tool {name}"
         return UNTRUSTED + (json.dumps(res, indent=1) if res else "no results")

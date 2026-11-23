@@ -110,7 +110,7 @@ class Toolbox:
             if fn:
                 out = fn(**args)
             elif name in ("web_search", "arxiv_search", "fetch_page") and self.cfg.get("research", True):
-                out = research.execute(name, args)
+                out = research.execute(name, args, allow_local=bool(self.cfg.get("sandbox_local")))
             else:
                 out = f"unknown tool {name}"
         except TypeError as e:
@@ -130,7 +130,8 @@ class Toolbox:
         t = int(timeout_s or (cap or 3600)); t = min(t, cap) if cap else t
         rc, out = sandbox.run_in_workspace(self.ws, argv, timeout=t, mem=c.get("sandbox_mem") or None, cpu_quota=c.get("cpu_quota"),
                                            internet=c.get("sandbox_internet", True), local=c.get("sandbox_local", False),
-                                           isolate=c.get("sandbox_isolate", True), ollama_url=c["ollama_url"], gate_dir=self.L.gate_dir)
+                                           isolate=c.get("sandbox_isolate", True), ollama_url=c["ollama_url"], gate_dir=self.L.gate_dir,
+                                           ro=self.L.ro_dirs)
         return f"[exit {rc}]\n{out.strip()[-30000:] or '(no output)'}"
 
     def t_run_python(self, code, timeout_s=None):

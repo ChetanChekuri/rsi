@@ -34,7 +34,8 @@ class Jobs:
         open(log, "a").write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {command}\n")
         p = sandbox.start_in_workspace(self.L.workspace, ["bash", "-c", command], log, mem=c.get("job_mem") or c.get("sandbox_mem") or None,
                                        cpu_quota=c.get("cpu_quota"), internet=c.get("sandbox_internet", True), local=c.get("sandbox_local", False),
-                                       isolate=c.get("sandbox_isolate", True), ollama_url=c["ollama_url"], gate_dir=self.L.gate_dir)
+                                       isolate=c.get("sandbox_isolate", True), ollama_url=c["ollama_url"], gate_dir=self.L.gate_dir,
+                                       ro=self.L.ro_dirs)
         self.procs[name] = p
         table[name] = {"command": command[:2000], "state": "running", "pid": p.pid, "cycle": cycle, "started": time.strftime("%Y-%m-%d %H:%M"),
                        "t0": time.time(), "log": os.path.relpath(log, self.L.workspace)}

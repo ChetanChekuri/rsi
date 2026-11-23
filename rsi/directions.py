@@ -25,17 +25,18 @@ def _tok_index(ends, c):
     return bisect.bisect_right(ends, c) - 1
 
 
-def decision_points(stream, records, items_by_id, post_answer_only=False, max_tokens=3072, per_trace=30, seed=0):
+def decision_points(stream, records, items_by_id, post_answer_only=False, max_tokens=3072, per_trace=30, seed=0, fmt=chat_prefix):
     rng = np.random.default_rng(seed)
     seqs, caps, labels, groups = [], [], [], []
     for gi, r in enumerate(records):
         th = r.get("thinking") or ""
         if not th:
             continue
-        prompt = chat_prefix(items_by_id[r["id"]]["prompt"])
+        prompt = fmt(items_by_id[r["id"]]["prompt"])
         text = prompt + th
         ids, offs = stream.enc_offsets(text)
-        ids, offs = ids[:max_tokens], offs[:max_tokens]
+        bos = list(getattr(stream, "bos", []) or [])   # models such as Llama need their start token
+        ids, offs = (bos + ids)[:max_tokens], ([(0, 0)] * len(bos) + list(offs))[:max_tokens]
         ends = [o[1] for o in offs]
         ap = answer_pos(th, r["gold"], r["kind"]); ap = len(prompt) + ap if ap >= 0 else -1
         pos, neg = [], []
@@ -56,17 +57,18 @@ def decision_points(stream, records, items_by_id, post_answer_only=False, max_to
     return seqs, caps, np.array(labels), np.array(groups)
 
 
-def reference_vs_own(stream, ref_items, records, max_tokens=2048):
+def reference_vs_own(stream, ref_items, records, max_tokens=2048, fmt=chat_prefix):
     """ref_items: rows {id, prompt, thinking, answer}; records: the subject's own traces on the same prompts"""
     seqs, caps, labels, groups = [], [], [], []
     own = {r["id"]: r for r in records}
     for gi, it in enumerate(ref_items):
         if it["id"] not in own:
             continue
-        prompt = chat_prefix(it["prompt"]); n0 = len(stream.enc(prompt))
-        ref_ids = stream.enc(prompt + it["thinking"].strip() + "\n</think>\n\n" + it["answer"].strip())[:max_tokens]
+        bos = list(getattr(stream, "bos", []) or [])
+        prompt = fmt(it["prompt"]); n0 = len(bos) + len(stream.enc(prompt))
+        ref_ids = (bos + stream.enc(prompt + it["thinking"].strip() + "\n</think>\n\n" + it["answer"].strip()))[:max_tokens]
         o = own[it["id"]]
-        own_ids = stream.enc(prompt + (o.get("thinking") or "").strip() + "\n</think>\n\n" + (o.get("content") or "").strip())
+        own_ids = bos + stream.enc(prompt + (o.get("thinking") or "").strip() + "\n</think>\n\n" + (o.get("content") or "").strip())
         L = len(ref_ids) - n0
         own_ids = own_ids[:n0 + L]
         if L < 8 or len(own_ids) - n0 < 8:

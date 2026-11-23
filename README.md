@@ -85,9 +85,11 @@ against the untouched model.
 By default code runs under bubblewrap in a systemd scope:
 
 - The workspace is the only writable place. The system, the rsi code and ollama's model files are read-only (the
-  model reads its own weights from there). Your home folder is hidden, so keys and other files aren't visible.
+  model reads its own weights from there; ollama's model folder is found whether it runs as a service, as you, from a
+  snap or with `OLLAMA_MODELS`). The rest of your home folder is hidden, so keys and other files aren't visible.
 - **Internet:** through a proxy run by the loop that only connects to public addresses. Code can download, pip
-  install and call APIs, but can't reach this machine's services or your home network.
+  install and call APIs, but can't reach this machine's services or your home network. `fetch_page` (which runs in
+  the loop itself) obeys the same rule, also for redirects.
 - **Ollama:** code can run and inspect any model through a door that allows chat, generate, embed, show and list.
   Creating and deleting models only goes through the tools, which keep track of which models the loop made, so your
   other models are safe.
@@ -140,16 +142,26 @@ On every start the loop detects the hardware (CUDA GPUs through torch, else `nvi
 RAM), shows it in the top bar, and sizes itself: parallel test problems, memory and CPU caps, and the device for the
 forward pass.
 
-Any model ollama runs can be the starting model. Reading and rewriting tensors, re-quantizing and registering work
-for every architecture. The layer-streaming forward pass (activations, log-likelihoods) covers the Qwen3.5 / Qwen3.8
-family (`qwen35`, its own implementation) and the standard decoder family: llama, mistral, qwen2, qwen3, granite
-and similar (`rsi/arch_generic.py`, tokenizer built from the GGUF itself). `check_stream()` confirms a forward pass
-agrees with ollama's next-token predictions before it is trusted (4/4 on Qwen3.5-0.8B and on Llama-3.2-1B, whose
-Llama 3 rope scaling and start token it handles); for other architectures the
-model can subclass it or write its own. For a quantized-only model, `rsi` uses a `-q8_0` / `-fp16` tag as the editable
-master when one exists; otherwise the model works on the quantized file and `write_gguf` re-encodes what it changes.
+Any chat model ollama runs can be the starting model, and any can be tested:
+- **Talking to it adapts to the model.** Each call asks ollama what the model can do: models that can't think are
+  never asked to, models without native tool calling get the tools as text (`<tool_call>{...}</tool_call>`) and
+  still produce ordinary tool calls, tool calls written as plain JSON are recovered, and the context window is capped
+  at what the model was trained for.
+- **Its weights:** reading and rewriting tensors, re-quantizing (llama.cpp's `llama-quantize`, found next to ollama,
+  on PATH or via `RSI_LLAMA_QUANTIZE`) and registering work for every GGUF. For a quantized-only model, `rsi` uses a
+  `-q8_0` / `-fp16` tag as the editable master when one exists; otherwise `write_gguf` re-encodes what changes.
+- **Looking inside it** (activations, likelihoods, gradient steps) needs a forward pass that matches its
+  architecture: Qwen3.5 / Qwen3.8 (`qwen35`, its own implementation) and the GGUF architectures `llama` (Llama 2 and
+  3.x, Mistral 7B, TinyLlama, ...), `qwen2` and `qwen3`, with byte-level BPE or SentencePiece vocabularies read
+  from the GGUF (`rsi/arch_generic.py`). Other architectures (Gemma, Phi-3, Granite, OLMo2, mixture-of-experts)
+  are refused with the reason instead of being run wrongly; the model can subclass the stream for them.
+  `check_stream()` confirms a forward pass agrees with ollama before it is trusted: 4/4 on Qwen3.5-0.8B and on
+  Llama-3.2-1B. The SentencePiece tokenizer follows llama.cpp's algorithm but has not yet been checked against a
+  real SentencePiece model.
+
 The 0.8B runs on a laptop CPU; a 27B model needs a 24-48 GB GPU and plenty of disk (each GGUF-based model it builds
-is another full copy; `max_models` caps how many it keeps).
+is another full copy; `max_models` caps how many it keeps). The pilot should be a capable tool-using model: a 1B
+model can run the tools but loses track of a whole cycle.
 
 The playbook also carries what is known about how weights map to behaviour (where outputs form, which layers are
 redundant, attention-sinks, why magnitude isn't importance, where and how to edit a behaviour), from the literature

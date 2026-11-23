@@ -1,8 +1,8 @@
-"""GGUF access for any model ollama runs (validated byte-exact on qwen35: Qwen3.5 0.8B ... Qwen3.8 27B).
+"""GGUF access for any model ollama runs (in-place Q8_0 writes validated byte-exact on Qwen3.5 and Llama 3.2).
 
 - metadata + per-tensor dequantization for any ggml type gguf-py understands (Q8_0, K-quants, F16, BF16, ...)
 - baking a list of edit specs into a copy of the master GGUF *in place* (byte layout unchanged), which requires the
-  edited tensors to be Q8_0 / F16 / BF16 / F32. Use a Q8_0 master (e.g. qwen3.8:27b-q8_0) for large models.
+  edited tensors to be Q8_0 / F16 / BF16 / F32. Use a Q8_0 master (a `-q8_0` tag) for large models.
 - deriving a smaller run quantization with llama.cpp's llama-quantize (bundled with ollama)
 - registering a GGUF with ollama, reusing the base model's Modelfile (projector, renderer, parser, parameters)
 """
@@ -98,10 +98,33 @@ def bake(base_path, out_path, specs, edit_fn):
     return n
 
 
-def derive_run_quant(src, dst, qtype, llama_quantize="/usr/local/lib/ollama/llama-quantize"):
-    env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(llama_quantize) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
-    subprocess.run([llama_quantize, "--allow-requantize", src, dst, qtype], check=True, env=env,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def find_quantizer():
+    """llama.cpp's llama-quantize: $RSI_LLAMA_QUANTIZE, on PATH, or next to ollama's own libraries"""
+    cands = [os.environ.get("RSI_LLAMA_QUANTIZE", ""), shutil.which("llama-quantize") or ""]
+    ol = shutil.which("ollama")
+    if ol:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(ol)))
+        cands += [os.path.join(root, "lib", "ollama", "llama-quantize"), os.path.join(root, "lib", "llama-quantize")]
+    cands += ["/usr/local/lib/ollama/llama-quantize", "/usr/lib/ollama/llama-quantize", "/opt/ollama/lib/ollama/llama-quantize"]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    raise FileNotFoundError("llama-quantize not found (it ships with some ollama builds and with llama.cpp). Install llama.cpp "
+                            "or set RSI_LLAMA_QUANTIZE; until then use F16/Q8_0 GGUFs, or `ollama create --quantize` from F16.")
+
+
+def quantize(src, dst, qtype):
+    """re-quantize a whole GGUF; raises with llama-quantize's own message on failure"""
+    q = find_quantizer()
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(q) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
+    p = subprocess.run([q, "--allow-requantize", src, dst, qtype], capture_output=True, text=True, env=env)
+    if p.returncode:
+        raise RuntimeError((p.stderr or p.stdout)[-1500:])
+    return dst
+
+
+def derive_run_quant(src, dst, qtype):
+    quantize(src, dst, qtype)
 
 
 DIRECTIVES = ("PARAMETER", "SYSTEM", "TEMPLATE", "ADAPTER", "MESSAGE", "LICENSE", "RENDERER", "PARSER")

@@ -181,6 +181,8 @@ def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
                 out = f"tool {name} is not available"
             calls.append({"name": name, "args": args, "result": out[:2000]})
             msgs.append({"role": "tool", "content": out, "tool_name": name})
+        for c in tc[4:]:
+            msgs.append({"role": "tool", "content": "not run: at most 4 tool calls per reply", "tool_name": c.get("function", {}).get("name", "")})
     m = r["message"]
     return {"id": problem["id"], "model": model, "prompt": problem["prompt"], "answer": problem.get("answer"), "content": m.get("content", ""), "thinking": m.get("thinking", ""), "tool_calls": calls,
             "done_reason": r.get("done_reason"), "tokens": tokens, "seconds": round(time.time() - t0, 1)}

@@ -1,12 +1,15 @@
-"""Models other than Qwen3.5: a layer-streaming forward pass for the standard decoder family (llama, mistral, qwen2,
-qwen3, granite, ...: RMSNorm, rotary attention with grouped KV heads, gated MLP), a tokenizer read straight from the
-GGUF, and a way to open the right one for any model file.
+"""Models other than Qwen3.5: a layer-streaming forward pass for the standard decoder family (GGUF architectures
+llama, qwen2, qwen3: Llama 2/3.x, Mistral and Mixtral-free llama-arch models, Qwen2/2.5, Qwen3, ...: RMSNorm, rotary
+attention with grouped KV heads and optional biases / q-k norms, gated SiLU MLP), tokenizers read straight from the
+GGUF (byte-level BPE and SentencePiece), and a way to open the right one for any model file. Architectures whose
+maths differ (Gemma, Phi-3, Granite, OLMo2, mixture-of-experts, ...) are refused with a clear error rather than run
+wrongly: subclass GenericStream for them and confirm with check_stream.
 
     S = open_stream(gguf_path)        # Qwen35Stream for qwen35, GenericStream for the llama family
     ids = S.bos + S.enc(text)         # S.enc never adds BOS; models like Llama 3 need it (S.bos) or they go off track
     check_stream(S, model_tag)        # does it predict the same next token as ollama? (verify before trusting it)
 """
-import json, os, re, urllib.request
+import heapq, json, os, re, urllib.request
 import numpy as np, torch, torch.nn.functional as F
 from .arch_qwen35 import Qwen35Stream
 from .gguf_io import GGUF
@@ -25,14 +28,105 @@ def field(g, key, default=None):
     return default if f is None else f.contents()
 
 
+class _Enc:
+    def __init__(self, ids, offsets):
+        self.ids, self.offsets = ids, offsets
+
+
+class SPMTokenizer:
+    """SentencePiece vocabularies (GGUF tokenizer model 'llama': Llama 2, Mistral 7B v0.1-0.3, TinyLlama, ...), encoded
+    the way llama.cpp does it: split on special tokens, a space prefix at the start and after each special token, spaces
+    as '▁', then repeatedly merge the adjacent pair whose concatenation is a vocabulary entry with the highest score;
+    pieces not in the vocabulary fall back to byte tokens <0xNN>. Same interface as a `tokenizers` Tokenizer for what
+    the streams use (encode(...).ids / .offsets, decode, get_vocab)."""
+
+    def __init__(self, g):
+        self.tokens = list(field(g, "tokenizer.ggml.tokens")); n = len(self.tokens)
+        self.scores = list(field(g, "tokenizer.ggml.scores") or [0.0] * n)
+        self.types = list(field(g, "tokenizer.ggml.token_type") or [1] * n)
+        self.index = {}
+        for i, t in enumerate(self.tokens):
+            self.index.setdefault(t, i)
+        self.space = bool(field(g, "tokenizer.ggml.add_space_prefix", True))
+        self.unk = int(field(g, "tokenizer.ggml.unknown_token_id", 0))
+        self.byte = {b: self.index.get(f"<0x{b:02X}>", self.unk) for b in range(256)}
+        sp = sorted((t for t, ty in zip(self.tokens, self.types) if ty in (2, 3, 4) and t), key=len, reverse=True)
+        self.special = re.compile("|".join(re.escape(t) for t in sp)) if sp else None
+
+    def get_vocab(self):
+        return dict(self.index)
+
+    def _merge(self, text):
+        if not text:
+            return []
+        n = len(text); start = list(range(n)); end = [i + 1 for i in range(n)]; nxt = list(range(1, n)) + [-1]; prv = list(range(-1, n - 1))
+        alive = [True] * n; heap = []
+
+        def push(l, r):
+            i = self.index.get(text[start[l]:end[r]])
+            if i is not None:
+                heapq.heappush(heap, (-self.scores[i], l, r, end[r]))
+        for i in range(n - 1):
+            push(i, i + 1)
+        while heap:
+            _, l, r, e = heapq.heappop(heap)
+            if not (alive[l] and alive[r] and nxt[l] == r and end[r] == e):
+                continue   # stale: one side changed since this pair was queued
+            end[l] = end[r]; alive[r] = False; nxt[l] = nxt[r]
+            if nxt[r] != -1:
+                prv[nxt[r]] = l
+            if prv[l] != -1:
+                push(prv[l], l)
+            if nxt[l] != -1:
+                push(l, nxt[l])
+        out, i = [], 0
+        while i != -1:
+            piece = text[start[i]:end[i]]; tid = self.index.get(piece)
+            if tid is not None:
+                out.append((tid, start[i], end[i]))
+            else:
+                out += [(self.byte[b], start[i], end[i]) for b in piece.encode("utf-8")]
+            i = nxt[i]
+        return out
+
+    def encode(self, text, add_special_tokens=False):
+        frags, pos = [], 0
+        for m in (self.special.finditer(text) if self.special else []):
+            frags += [(False, text[pos:m.start()], pos), (True, m.group(), m.start())]; pos = m.end()
+        frags.append((False, text[pos:], pos))
+        ids, offs, prev_special = [], [], True
+        for special, piece, at in frags:
+            if special:
+                ids.append(self.index[piece]); offs.append((at, at + len(piece))); prev_special = True; continue
+            if not piece:
+                continue
+            pre = " " if self.space and prev_special else ""
+            for tid, a, b in self._merge((pre + piece).replace(" ", "\u2581")):
+                ids.append(tid); offs.append((at + max(a - len(pre), 0), at + max(b - len(pre), 0)))
+            prev_special = False
+        return _Enc(ids, offs)
+
+    def decode(self, ids):
+        out = bytearray()
+        for i in ids:
+            t, ty = self.tokens[int(i)], self.types[int(i)]
+            if ty == 6 or re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", t):
+                out += bytes([int(t[3:5], 16)])
+            elif ty != 3:   # control tokens print as nothing
+                out += t.replace("\u2581", " ").encode("utf-8")
+        return out.decode("utf-8", errors="replace")
+
+
 def gguf_tokenizer(path):
-    """a `tokenizers` Tokenizer built from the GGUF's own vocabulary (byte-level BPE models: Qwen, Llama 3, Mistral
-    Nemo, ...). SentencePiece ('llama') vocabularies are not supported here."""
+    """the model's own tokenizer, built from its GGUF: byte-level BPE ('gpt2': Qwen, Llama 3, Mistral Nemo, ...) or
+    SentencePiece ('llama': Llama 2, Mistral 7B, TinyLlama, ...)"""
     from tokenizers import Tokenizer, Regex, models, pre_tokenizers, decoders
     g = GGUF(path)
     kind = field(g, "tokenizer.ggml.model")
+    if kind == "llama":
+        return SPMTokenizer(g)
     if kind != "gpt2":
-        raise NotImplementedError(f"tokenizer type {kind!r}: only byte-level BPE ('gpt2') vocabularies are built from the GGUF")
+        raise NotImplementedError(f"tokenizer type {kind!r}: built-in support covers byte-level BPE ('gpt2') and SentencePiece ('llama')")
     toks = field(g, "tokenizer.ggml.tokens"); merges = field(g, "tokenizer.ggml.merges") or []
     types = field(g, "tokenizer.ggml.token_type") or [1] * len(toks)
     pre = field(g, "tokenizer.ggml.pre", "default")
@@ -49,8 +143,24 @@ class GenericStream(Qwen35Stream):
     """Layer-streaming forward pass for standard decoder-only transformers. Same interface as Qwen35Stream
     (run, enc, capture, score) and the same edit hooks."""
 
-    def __init__(self, gguf_path, tokenizer=None, device="auto", base_dir="", lm_cache_gb=3.0):
+    SUPPORTED = {"llama", "qwen2", "qwen3"}
+    LAYER_TENSORS = {"attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_q.bias", "attn_k.bias",
+                     "attn_v.bias", "attn_output.bias", "attn_q_norm.weight", "attn_k_norm.weight", "ffn_norm.weight", "ffn_gate.weight",
+                     "ffn_up.weight", "ffn_down.weight"}
+
+    def __init__(self, gguf_path, tokenizer=None, device="auto", base_dir="", lm_cache_gb=3.0, force=False):
         self.g = GGUF(gguf_path); m = self.g.meta; self.arch = self.g.arch
+        layer0 = {n[len("blk.0."):] for n in self.g.T if n.startswith("blk.0.")}
+        unknown = sorted(layer0 - self.LAYER_TENSORS); missing = sorted({"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                                                                         "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"} - layer0)
+        scaling = str(m("rope.scaling.type", "none") or "none")
+        if not force and (self.arch not in self.SUPPORTED or unknown or missing or scaling not in ("none", "linear")):
+            raise NotImplementedError(
+                f"GenericStream implements the llama / qwen2 / qwen3 layer maths; this GGUF is {self.arch!r}"
+                + (f" with layer tensors it doesn't know ({', '.join(unknown)})" if unknown else "")
+                + (f", missing {', '.join(missing)}" if missing else "") + (f", rope scaling {scaling!r}" if scaling not in ("none", "linear") else "")
+                + ". Subclass GenericStream (override block/attention) for this architecture, or pass force=True if you know the maths "
+                  "match, and confirm with check_stream().")
         self.L = int(m("block_count")); self.D = int(m("embedding_length"))
         self.H = int(m("attention.head_count")); kv = m("attention.head_count_kv", self.H)
         self.KV = int(kv if np.ndim(kv) == 0 else kv[0])
@@ -67,6 +177,8 @@ class GenericStream(Qwen35Stream):
         self.bos = [int(bos_id)] if add_bos and bos_id is not None else []   # prefix S.bos + S.enc(text) for a document start
         self.vgroup, self.base_dir, self.lm_cache_gb = "interleave", base_dir, lm_cache_gb
         self.inv = 1.0 / (self.theta ** (torch.arange(0, self.rd, 2, dtype=torch.float64, device=self.dev) / self.rd))
+        if scaling == "linear":   # positions compressed by a constant factor
+            self.inv = self.inv / float(m("rope.scaling.factor", 1.0) or 1.0)
         if "rope_freqs.weight" in self.g.T:   # per-frequency divisors (Llama 3.1+ long-context scaling)
             self.inv = self.inv / torch.tensor(np.array(self.g.deq("rope_freqs.weight")), dtype=torch.float64, device=self.dev).flatten()[: self.rd // 2]
         self.lm_name = "output.weight" if "output.weight" in self.g.T else "token_embd.weight"
@@ -108,12 +220,15 @@ class GenericStream(Qwen35Stream):
         return x + self.lin(F.silu(self.lin(h, W[p + "ffn_gate.weight"])) * self.lin(h, W[p + "ffn_up.weight"]), W[p + "ffn_down.weight"])
 
 
-def open_stream(gguf_path, device="auto"):
-    """the right streaming forward pass for a model file"""
-    arch = GGUF(gguf_path).arch
+def open_stream(gguf_path, device="auto", force=False):
+    """the right streaming forward pass for a model file (raises NotImplementedError, saying why, for architectures
+    neither implements: write your own subclass for those)"""
+    g = GGUF(gguf_path); arch = g.arch
     if arch == "qwen35":   # its own forward pass (gated delta-net layers); the tokenizer ships with rsi
+        if any(n.endswith("_exps.weight") for n in g.T) and not force:
+            raise NotImplementedError("Qwen35Stream implements the dense Qwen3.5 layers; this is a mixture-of-experts model")
         return Qwen35Stream(gguf_path, os.path.join(ROOT, "data", "qwen35_tokenizer.json"), device)
-    return GenericStream(gguf_path, device=device)
+    return GenericStream(gguf_path, device=device, force=force)
 
 
 def check_stream(S, model_tag, prompts=("The capital of France is", "def add(a, b):\n    return", "The opposite of hot is",

@@ -14,7 +14,13 @@ import os, shutil, subprocess, sys
 from . import netgate
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BLOBS = "/usr/share/ollama/.ollama/models/blobs"
+
+
+def model_dirs():
+    """where ollama keeps model files on this machine (system service, user install, snap, or $OLLAMA_MODELS)"""
+    roots = [os.environ.get("OLLAMA_MODELS", ""), "/usr/share/ollama/.ollama/models", os.path.expanduser("~/.ollama/models"),
+             "/var/lib/ollama/models", "/var/snap/ollama/common/models"]
+    return sorted({os.path.realpath(os.path.join(r, "blobs")) for r in roots if r and os.path.isdir(os.path.join(r, "blobs"))})
 
 
 def _gpu_devices():
@@ -23,8 +29,9 @@ def _gpu_devices():
 
 
 def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=False, isolate=True,
-            ollama_url="http://127.0.0.1:11434", gate_dir=None, env=None):
-    """-> (cmd, env for subprocess or None, cwd): argv wrapped in the sandbox with the workspace as its home"""
+            ollama_url="http://127.0.0.1:11434", gate_dir=None, env=None, ro=()):
+    """-> (cmd, env for subprocess or None, cwd): argv wrapped in the sandbox with the workspace as its home.
+    ro: extra folders to show read-only (e.g. where the model's own GGUF lives)"""
     ws = os.path.realpath(workspace); os.makedirs(os.path.join(ws, ".pkgs"), exist_ok=True)
     venv = os.path.realpath(os.path.dirname(os.path.dirname(sys.executable)))
     pyroot = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
@@ -34,6 +41,7 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
                 "PATH": f"{venv}/bin:{ROOT}/rsi/sbin:{w}/.pkgs/bin:/usr/local/bin:/usr/bin:/bin",
                 "LANG": "C.UTF-8", "TERM": "dumb", **(env or {})}
     if not isolate:
+        base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1].rstrip("/")
         cmd = list(argv); run_env = dict(os.environ, **base_env)
     else:
         b = ["bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-user-try",
@@ -42,14 +50,15 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
         for p in {venv, pyroot, ROOT}:
             if os.path.exists(p) and not p.startswith("/usr/"):
                 b += ["--ro-bind", p, p]
-        if os.path.exists(BLOBS):
-            b += ["--ro-bind", BLOBS, BLOBS]
+        for d in sorted(set(model_dirs()) | {os.path.realpath(x) for x in ro if x and os.path.isdir(x)}):
+            if not d.startswith("/usr/"):
+                b += ["--ro-bind", d, d]
         for d in _gpu_devices():
             b += ["--dev-bind", d, d]
         b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", "/workspace", "--clearenv"]   # also at its real path
         inner = list(argv)
         if local:
-            base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1]
+            base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1].rstrip("/")
         else:
             b += ["--unshare-net"]
             doors = netgate.ensure(gate_dir or os.path.join(ws, ".net"), ollama_url)

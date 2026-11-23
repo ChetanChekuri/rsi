@@ -165,29 +165,24 @@ def write_gguf(out, tensors=None, types=None, metadata=None, drop=(), base=None)
 
 
 def requantize(src, dst, qtype="Q4_K_M"):
-    """re-quantize a whole GGUF with llama.cpp's llama-quantize (bundled with ollama)"""
-    q = "/usr/local/lib/ollama/llama-quantize"
+    """re-quantize a whole GGUF with llama.cpp's llama-quantize (found next to ollama, on PATH, or $RSI_LLAMA_QUANTIZE)"""
+    from rsi.gguf_io import quantize
     dst = dst if os.path.isabs(dst) else os.path.join(WS, dst)
-    env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(q) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
-    p = subprocess.run([q, "--allow-requantize", src, dst, qtype], capture_output=True, text=True, env=env)
-    if p.returncode:
-        raise RuntimeError(p.stderr[-1500:])
-    return dst
+    return quantize(src, dst, qtype)
 
 
 def chat(model, messages, think=True, tools=None, **options):
     """one reply from any model on the ollama server. messages: a string or a list of {role, content}.
-    Returns the message dict (content, thinking, tool_calls)."""
+    think: True/False/"low"/"medium"/"high" (ignored for models that can't think). tools: function schemas (models
+    without native tool calling get them as text; you still get tool_calls back). options: ollama options
+    (num_predict, num_ctx, temperature, seed, ...). Returns the message dict (content, thinking, tool_calls)."""
+    from rsi import llm
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
-    body = {"model": model, "messages": messages, "stream": False, "think": think, "options": options}
-    if tools:
-        body["tools"] = tools
     host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
-    req = urllib.request.Request(f"http://{host}/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=3600) as resp:
-        return json.loads(resp.read())["message"]
+    cfg = {"ollama_url": host if host.startswith("http") else f"http://{host}", "num_ctx": options.pop("num_ctx", 8192),
+           "num_predict": options.pop("num_predict", 4096)}
+    return llm.chat(cfg, model, messages, think=think, tools=tools, seed=options.pop("seed", 0), options=options, timeout=3600)["message"]
 
 
 def test_results(run=None):
@@ -210,13 +205,14 @@ def n_layers(path=None):
     return int(open_gguf(path).meta("block_count"))
 
 
-def stream(path=None, device="auto"):
+def stream(path=None, device="auto", force=False):
     """a layer-streaming forward pass over a GGUF (activations, log-likelihoods; ~1 GB resident even for 27B).
-    Qwen3.5/3.8: rsi/arch_qwen35.py. llama, mistral, qwen2, qwen3, granite...: rsi/arch_generic.py. Anything else:
-    write your own (subclass GenericStream). Verify a stream with check_stream() before trusting it. Tokens:
+    Qwen3.5/3.8: rsi/arch_qwen35.py. GGUF architectures llama (Llama 2/3, Mistral 7B, ...), qwen2, qwen3:
+    rsi/arch_generic.py (BPE and SentencePiece tokenizers from the GGUF). Anything else raises NotImplementedError:
+    subclass GenericStream for it. Verify a stream with check_stream() before trusting it. Tokens:
     S.bos + S.enc(text) (S.enc never adds the start token; models such as Llama 3 need it)."""
     from rsi.arch_generic import open_stream
-    return open_stream(path or current_gguf(), device)
+    return open_stream(path or current_gguf(), device, force)
 
 
 def check_stream(S=None, model=None):
@@ -292,7 +288,9 @@ def doubt_direction(records, post_answer=True, path=None):
     recs = [dict(r, gold=str(r.get("answer") or ""), kind="num" if re.fullmatch(r"-?[\d.]+", str(r.get("answer") or "")) else "word")
             for r in records if r.get("thinking")]
     byid = {r["id"]: {"prompt": r.get("prompt", "")} for r in recs}
-    seqs, caps, y, g = directions.decision_points(S, recs, byid, post_answer_only=post_answer)
+    from rsi.gradstep import chat_text
+    fmt = lambda q: chat_text(S, q, thinking=True)   # your own chat template, opened for thinking
+    seqs, caps, y, g = directions.decision_points(S, recs, byid, post_answer_only=post_answer, fmt=fmt)
     acts = S.run(seqs, capture=caps)[0]["pos"]
     rows, D = directions.stats(acts, y, g)
     return D, rows

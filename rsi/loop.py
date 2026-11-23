@@ -184,6 +184,9 @@ def create(folder, model, goal):
     pl, problem = plan(model, admin.split("://")[-1])
     if problem:
         raise ValueError(problem)
+    caps = llm.model_caps(settings.for_new_loop(True), model)["caps"]
+    if caps is not None and "completion" not in caps:
+        raise ValueError(f"{model} can't chat (its capabilities: {', '.join(sorted(caps))}); pick a chat model")
     pc = pl["params"].upper()
     small = pc.endswith("M") or (pc.endswith("B") and pc[:-1].replace(".", "", 1).isdigit() and float(pc[:-1]) <= 4)
     cfg = {**settings.for_new_loop(small), "model": model, "goal": goal, "master_tag": pl["master_tag"], "run_quant": pl["run_quant"], "arch": pl["arch"],
@@ -246,7 +249,30 @@ class Loop:
         return self.gen["tag"]
 
     def gguf_of(self, tag):
-        return gguf_io.ollama_show(tag, self.admin)[0]
+        """the GGUF behind a model (cached briefly: the system prompt asks for it at every step)"""
+        c = getattr(self, "_gguf_cache", {}); self._gguf_cache = c
+        if tag not in c or time.time() - c[tag][0] > 120:
+            c[tag] = (time.time(), gguf_io.ollama_show(tag, self.admin)[0])
+        return c[tag][1]
+
+    @property
+    def ro_dirs(self):
+        """folders the sandbox shows read-only besides the workspace: where your weights and the master live"""
+        out = set()
+        for t in {self.tag, self.cfg["master_tag"]}:
+            try:
+                out.add(os.path.dirname(self.gguf_of(t)))
+            except Exception:  # noqa: BLE001
+                pass
+        return sorted(out)
+
+    def arch(self):
+        if not self.cfg.get("arch"):   # loops made before the architecture was recorded
+            try:
+                cfg = self.s.cfg; cfg["arch"] = gguf_io.GGUF(self.gguf_of(self.cfg["master_tag"])).arch; self.s.write("config.json", cfg); self.reload()
+            except Exception:  # noqa: BLE001
+                return "unknown"
+        return self.cfg["arch"]
 
     def add_generation(self, tag, note):
         n = len(self.lineage["generations"])
@@ -283,10 +309,12 @@ class Loop:
         tests.write_library(self.workspace)
 
     def write_context(self, k):
-        json.dump({"goal": self.cfg["goal"], "cycle": k, "generation": self.lineage["current"], "current_model": self.tag,
-                   "current_gguf": self.gguf_of(self.tag), "editable_master_gguf": self.gguf_of(self.cfg["master_tag"]),
-                   "arch": self.cfg.get("arch", "qwen35"), "ollama_host": "127.0.0.1:11434",
-                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json") if self.cfg.get("arch", "qwen35") == "qwen35" else None,
+        c = self.cfg; arch = self.arch()
+        host = "127.0.0.1:11434" if c.get("sandbox_isolate", True) and not c.get("sandbox_local") else c["ollama_url"].split("://")[-1]
+        json.dump({"goal": c["goal"], "cycle": k, "generation": self.lineage["current"], "current_model": self.tag,
+                   "current_gguf": self.gguf_of(self.tag), "editable_master_gguf": self.gguf_of(c["master_tag"]),
+                   "arch": arch, "ollama_host": host,
+                   "tokenizer": os.path.join(ROOT, "data", "qwen35_tokenizer.json") if arch == "qwen35" else "read from the GGUF (rsi_lib.stream())",
                    "device": "cuda" if self.hw["cuda"] else "cpu", "hardware": self.hw["label"],
                    "lineage": self.lineage["generations"]}, open(os.path.join(self.workspace, ".rsi_context.json"), "w"), indent=1)
 
@@ -418,6 +446,9 @@ class Loop:
                 out = tb.call(name, args if isinstance(args, dict) else {})
                 self.note("result", out[:3000])
                 self.chat.append({"role": "tool", "content": out, "tool_name": name})
+            for call in calls[4:]:   # every call gets an answer, or some chat templates break
+                self.chat.append({"role": "tool", "content": "not run: at most 4 tool calls per reply; call it again if you still need it",
+                                  "tool_name": call.get("function", {}).get("name", "")})
             self._save_chat()
             if tb.finished:
                 break
