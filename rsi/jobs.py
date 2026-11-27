@@ -1,14 +1,13 @@
-"""Background jobs: long work (training, data generation, big evaluations) that runs in the sandbox while the model
-keeps working. Output goes to workspace/jobs/<name>.log. When a job ends, the loop tells the model at its next step.
+"""Background jobs run inside the sandbox. The host records output in its own state directory.
 Jobs live as long as the loop: `rsi stop` (or a crash) ends them, and on restart they are reported as lost."""
 import os, re, signal, time
-from . import sandbox
+from . import sandbox, workspace_files
 
 
 class Jobs:
     def __init__(self, loop):
         self.L = loop; self.procs = {}
-        self.dir = os.path.join(loop.workspace, "jobs"); os.makedirs(self.dir, exist_ok=True)
+        self.dir = loop.s.p("state", "job_logs"); os.makedirs(self.dir, exist_ok=True)
         table = self.table()
         for j in table.values():   # a previous loop process ran these; they died with it
             if j["state"] == "running":
@@ -33,14 +32,14 @@ class Jobs:
         log = os.path.join(self.dir, f"{name}.log")
         open(log, "a").write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {command}\n")
         p = sandbox.start_in_workspace(self.L.workspace, ["bash", "-c", command], log, mem=c.get("job_mem") or c.get("sandbox_mem") or None,
-                                       cpu_quota=c.get("cpu_quota"), internet=c.get("sandbox_internet", True), local=c.get("sandbox_local", False),
+                                       cpu_quota=c.get("cpu_quota"), internet=c.get("sandbox_internet", False), local=c.get("sandbox_local", False),
                                        isolate=c.get("sandbox_isolate", True), ollama_url=c["ollama_url"], gate_dir=self.L.gate_dir,
                                        ro=self.L.ro_dirs)
         self.procs[name] = p
         table[name] = {"command": command[:2000], "state": "running", "pid": p.pid, "cycle": cycle, "started": time.strftime("%Y-%m-%d %H:%M"),
-                       "t0": time.time(), "log": os.path.relpath(log, self.L.workspace)}
+                       "t0": time.time(), "log": os.path.basename(log), "host_log": True}
         self.save(table)
-        return f"started job {name}; output goes to {table[name]['log']}. You'll be told when it ends (job_log to look before that)."
+        return f"started job {name}; use job_log to see its output. You'll be told when it ends."
 
     def poll(self):
         """update states; returns the jobs that ended since the last poll (not yet reported)"""
@@ -62,8 +61,11 @@ class Jobs:
         if not j:
             return None
         try:
-            return "".join(open(os.path.join(self.L.workspace, j["log"]), errors="replace").readlines()[-int(lines):])
-        except OSError:
+            root = self.dir if j.get("host_log") else self.L.workspace
+            with workspace_files.open_file(root, os.path.join(root, j["log"])) as f:
+                from collections import deque
+                return "".join(deque(f, maxlen=max(0, int(lines))))
+        except (OSError, ValueError):
             return ""
 
     def stop(self, name):

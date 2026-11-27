@@ -42,7 +42,7 @@ def decision_points(stream, records, items_by_id, post_answer_only=False, max_to
         pos, neg = [], []
         for m in re.finditer(r"\n+", th):
             c = len(prompt) + m.end()
-            if c >= len(text) or (post_answer_only and not (ap >= 0 and c > ap)):
+            if not ends or c > ends[-1] or c >= len(text) or (post_answer_only and not (ap >= 0 and c > ap)):
                 continue
             t = _tok_index(ends, c)
             if t < 1 or t >= len(ids):
@@ -79,15 +79,18 @@ def reference_vs_own(stream, ref_items, records, max_tokens=2048, fmt=chat_prefi
 
 
 def _auc(y, s):
-    order = np.argsort(s); ranks = np.empty(len(s)); ranks[order] = np.arange(1, len(s) + 1)
     n1 = int(y.sum()); n0 = len(y) - n1
     if n1 < 3 or n0 < 3:
         return None
-    return float((ranks[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+    _, inverse, counts = np.unique(s, return_inverse=True, return_counts=True)
+    average_ranks = np.cumsum(counts) - (counts - 1) / 2
+    return float((average_ranks[inverse[y == 1]].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
 def stats(per_layer, y, groups):
     """per_layer: {l: (n, D)} in the same order as y/groups -> (table rows, directions (L, D))"""
+    if not per_layer or len(np.unique(y)) != 2:
+        raise ValueError("the trace contrast needs examples of both classes")
     fold = np.array([int(hashlib.md5(str(g).encode()).hexdigest(), 16) % 2 for g in groups])
     rows, dirs = [], []
     for l in sorted(per_layer):

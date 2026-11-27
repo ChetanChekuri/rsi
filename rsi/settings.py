@@ -8,6 +8,7 @@
 A running loop picks up changes at its next step.
 """
 import json, os, sys
+from .network import local_url
 
 GLOBAL = os.path.expanduser("~/.config/rsi/settings.json")
 THINK = ["on", "off", "low", "medium", "high"]
@@ -24,11 +25,10 @@ SCHEMA = [
     ("max_steps", "Main model", "Tool calls per cycle", "int", 0, "0 = no limit"),
     ("max_cycle_minutes", "Main model", "Minutes per cycle", "int", 0, "0 = no limit"),
     ("auto_continue", "Main model", "Continue on its own", "bool", True, "start the next cycle on its own plan; off = wait for your message"),
-    ("require_tests_before_switch", "Main model", "Test before switching", "bool", True, "it may only switch to a model it has tested"),
-    ("research", "Main model", "Web research tools", "bool", True, "web_search, arxiv_search, fetch_page"),
+    ("research", "Main model", "Web research tools", "bool", True, "Tinyfish only: web_search, arxiv_search, fetch_page"),
     ("sandbox_isolate", "Sandbox", "Isolation", "bool", True, "code runs in a sandbox: only the workspace is writable, your home is hidden"),
-    ("sandbox_internet", "Sandbox", "Internet", "bool", True, "code can reach the public internet (pip, downloads, APIs)"),
-    ("sandbox_local", "Sandbox", "Local network", "bool", False, "code can also reach this machine's services, including ollama's admin API"),
+    ("sandbox_internet", "Sandbox", "Internet", "bool", False, "must stay off; use Tinyfish research tools"),
+    ("sandbox_local", "Sandbox", "Local network", "bool", False, "must stay off; only local inference is exposed"),
     ("sandbox_mem", "Sandbox", "Memory cap", "str", ("4G", "48G"), "per code run; empty = no cap"),
     ("sandbox_cpu", "Sandbox", "CPU cap", "str", "", "per code run, e.g. 400% = 4 cores; empty = half the cores on CPU-only machines"),
     ("max_run_s", "Sandbox", "Time limit per run (s)", "int", 3600, "for run_python / run_shell (background jobs have none); 0 = no limit"),
@@ -67,7 +67,15 @@ def read_global():
 
 
 def for_new_loop(small):
-    return {**defaults(small), **{k: v for k, v in read_global().items() if k in KEYS}}
+    return policy({**defaults(small), **{k: v for k, v in read_global().items() if k in KEYS}})
+
+
+def policy(cfg):
+    # Old sessions are migrated to the mandatory network boundary in memory.
+    cfg = dict(cfg, sandbox_isolate=True, sandbox_internet=False, sandbox_local=False)
+    for key in ("ollama_url", "ollama_admin_url"):
+        cfg[key] = local_url(cfg[key])
+    return cfg
 
 
 def effective(cfg, sizing):
@@ -77,7 +85,7 @@ def effective(cfg, sizing):
     out.update(device=sizing.get("device", "cpu"), workers=int(out.get("test_workers") or sizing.get("workers") or 1),
                cpu_quota=out.get("sandbox_cpu") or sizing.get("cpu_quota"), memory_cap=sizing.get("memory_cap"))
     out["num_predict"] = out.get("test_num_predict") or out.get("num_predict", 4096)
-    return out
+    return policy(out)
 
 
 def think(v):
@@ -88,6 +96,12 @@ def think(v):
 def parse(key, text):
     typ = next(s for s in SCHEMA if s[0] == key)[3]
     text = str(text).strip()
+    if key in ("ollama_url", "ollama_admin_url"):
+        return local_url(text)
+    if key == "sandbox_isolate" and text.lower() not in ("1", "true", "on", "yes"):
+        raise ValueError("isolation is required")
+    if key in ("sandbox_internet", "sandbox_local") and text.lower() not in ("0", "false", "off", "no"):
+        raise ValueError("code network access is disabled; use Tinyfish research tools")
     if typ == "bool":
         if text.lower() in ("1", "true", "on", "yes"):
             return True
@@ -121,7 +135,7 @@ def load(path, small):
         cur = json.load(open(path))
     except (OSError, ValueError):
         cur = {}
-    return {**(defaults(small) if path != GLOBAL else for_new_loop(small)), **{k: v for k, v in cur.items() if k in KEYS}}, cur
+    return policy({**(defaults(small) if path != GLOBAL else for_new_loop(small)), **{k: v for k, v in cur.items() if k in KEYS}}), cur
 
 
 def save(path, key, value):
@@ -189,7 +203,7 @@ def _screen_classes():
                                                        (f"   default {dflt if dflt not in (None, '') else 'empty'}", "#4b5864")), classes="help")
                         v = self.vals.get(key)
                         if typ == "bool":
-                            yield Switch(value=bool(v), id=f"s-{key}")
+                            yield Switch(value=bool(v), id=f"s-{key}", disabled=key in ("sandbox_isolate", "sandbox_internet", "sandbox_local"))
                         elif typ == "choice":
                             yield Select([(c, c) for c in THINK], value=think_label(v), allow_blank=False, id=f"s-{key}")
                         else:

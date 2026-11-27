@@ -35,9 +35,17 @@ def chat_text(S, user, system=None, thinking=False, assistant_prefix=""):
 
 def _tokens(S, prompt, answer):
     ids = S.enc(prompt)
+    joined = S.enc(prompt + answer)
+    if joined[:len(ids)] == ids:
+        ans = joined[len(ids):]
+    else:
+        ans = S.enc(answer)
+        if S.tok.decode(ids + ans) != S.tok.decode(joined):
+            raise ValueError("prompt and answer need a stable token boundary")
     if S.bos and (not ids or ids[0] != S.bos[0]):
         ids = S.bos + ids
-    ans = S.enc(answer)
+    if not ids or not ans:
+        raise ValueError("each example needs prompt and answer tokens")
     return ids + ans[:-1], [(len(ids) - 1 + i, t) for i, t in enumerate(ans)]
 
 
@@ -51,8 +59,13 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
     (what grow_mlp / grow_layers return as "new"), for training parameters you added.
     Returns a dict: summary, gain gradients per example (ffn_down neurons), low-rank gradient factors per matrix, and
     "exact": {name: (spec, gradient array)} (mean over examples)."""
+    examples = list(examples)
+    if not examples or batch < 1 or loss not in ("margin", "nll"):
+        raise ValueError("gradient measurement needs examples, a positive batch, and margin or nll loss")
     t0 = time.time()
     L = S.L; layers = sorted(layers) if layers is not None else list(range(L // 2, L)); exact = dict(exact or {})
+    if not layers or min(layers) < 0 or max(layers) >= L:
+        raise ValueError("select at least one valid layer")
     start = min([layers[0]] + [int(n.split(".")[1]) for n in exact]); E = {}
     on = torch.as_tensor(np.array(S.g.deq("output_norm.weight")), device=S.dev)
     head = [(a, Wc.to(torch.bfloat16 if S.dev.type == "cpu" else Wc.dtype).clone()) for a, b, Wc in S._lm_chunks(chunk=32768)]
@@ -115,7 +128,7 @@ def measure(S, examples, layers=None, targets=TARGETS, loss="margin", rank=4, sk
                     if not sk:
                         continue
                     if kind == "ffn_down":   # per-example neuron gain gradient: sum_t a_tj (dout_t . W[:, j])
-                        per[l] = (xin * (dout @ Wm)).sum(1).float().cpu()
+                        per[l] = (xin.float() * (dout.float() @ Wm.float())).sum(1).cpu()
                     d2, i2 = dout.reshape(-1, dout.shape[-1]).float(), xin.reshape(-1, xin.shape[-1]).float()
                     if key not in Om:
                         Om[key] = torch.randn(i2.shape[1], sketch, generator=gen).to(S.dev); Ps[key] = torch.randn(d2.shape[1], sketch, generator=gen).to(S.dev)

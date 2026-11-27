@@ -13,6 +13,7 @@ import heapq, json, os, re, urllib.request
 import numpy as np, torch, torch.nn.functional as F
 from .arch_qwen35 import Qwen35Stream
 from .gguf_io import GGUF
+from . import llm, network
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NEOX = {"qwen2", "qwen3", "qwen2moe", "phi3", "stablelm", "gptneox", "olmo2", "exaone"}   # rotate halves; others rotate pairs
@@ -245,8 +246,9 @@ def check_stream(S, model_tag, prompts=("The capital of France is", "def add(a, 
         out = S.run([ids + [ids[-1]]], score=[{"argmax": (len(ids), len(ids) + 1)}])[0]["argmax"][0]
         mine = S.tok.decode([int(out[-1])])
         body = {"model": model_tag, "prompt": p, "raw": True, "stream": False, "options": {"temperature": 0, "num_predict": 1, "seed": 0}}
-        host_url = host if host.startswith("http") else "http://" + host
-        r = json.loads(urllib.request.urlopen(urllib.request.Request(host_url + "/api/generate", json.dumps(body).encode(),
+        host_url = network.local_url(host)
+        llm.model_caps({"ollama_url": host_url}, model_tag, require_local=True)
+        r = json.loads(network.open_local(urllib.request.Request(host_url + "/api/generate", json.dumps(body).encode(),
                                                                      {"Content-Type": "application/json"}), timeout=600).read())
         theirs = r.get("response", "")
         res.append({"prompt": p, "stream": mine, "ollama": theirs, "agree": mine == theirs and mine != ""})

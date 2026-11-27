@@ -309,9 +309,18 @@ class Main(Screen):
         elif self.s.pid():
             self.notify(f"reconnected: the loop is running ({n} cycles so far)", timeout=4)
         else:
-            self.s.start(); self.restarted = time.time()
-            self.notify(f"resumed the loop from cycle {n}" if n else "started the loop", timeout=4)
+            if self._start_loop():
+                self.notify(f"resumed the loop from cycle {n}" if n else "started the loop", timeout=4)
         self.tick(); self.set_interval(0.5, self.tick)
+
+    def _start_loop(self):
+        try:
+            self.s.start()
+            self.restarted = time.time()
+            return True
+        except Exception as exc:
+            self.notify(str(exc), severity="error", timeout=15)
+            return False
 
     # -------- actions
     def action_tab(self, name):
@@ -331,8 +340,9 @@ class Main(Screen):
                     self.s.stop(); self.notify("stopped; ctrl+s resumes", timeout=4)
             self.app.push_screen(ConfirmStop(), go)
         else:
-            self.s.start(); self.restarted = time.time(); self.autostart = True
-            self.notify("resumed the loop", timeout=4)
+            if self._start_loop():
+                self.autostart = True
+                self.notify("resumed the loop", timeout=4)
 
     @on(Input.Submitted, "#prompt")
     def send(self, ev):
@@ -357,8 +367,7 @@ class Main(Screen):
     def tick(self):
         cfg = self.s.cfg; st = self.s.read("status.json", {}) or {}; lin = self.s.read("lineage.json", {}) or {}
         hist = self.s.history(); running = bool(self.s.pid()); sd = self.s.dir
-        if self.autostart and not running and not self.s.stopped() and time.time() - self.restarted > 60:   # died: resume it
-            self.s.start(); self.restarted = time.time()
+        # The persistent service owns restart and boot recovery; observing it must not start a stopped loop.
         step = st.get("step", "starting") if running else ("stopped" if self.s.stopped() else st.get("step", "starting"))
         self._header(cfg, st, lin, running, step)
         self._now(st, running, step)
@@ -447,9 +456,10 @@ class Main(Screen):
 
     def _tests(self):
         runs = self.s.read("state/test_runs.json", []) or []
-        if self.sigs.get("tests") == len(runs):
+        key = len(runs), runs[-1].get("run_id") if runs else None
+        if self.sigs.get("tests") == key:
             return
-        self.sigs["tests"] = len(runs)
+        self.sigs["tests"] = key
         t = self.query_one("#tests-table", DataTable); t.clear()
         self.run_ids = []
         for r in reversed(runs):
@@ -526,7 +536,8 @@ class Main(Screen):
                                   (f"   exit {j['exit_code']}" if j.get("exit_code") is not None else "", DIM)),
                     Padding(Syntax(j.get("command", "")[:400], "bash", theme="monokai", background_color=PANEL, word_wrap=True), (0, 0, 0, 2))]
             if st == "running":
-                log = tail(os.path.join(self.s.folder, "workspace", j.get("log", "")), 8)
+                root = self.s.p("state", "job_logs") if j.get("host_log") else os.path.join(self.s.folder, "workspace")
+                log = tail(os.path.join(root, j.get("log", "")), 8)
                 out.append(Padding(Text("\n".join(log), style="#8d9aa5"), (0, 0, 0, 2)))
             out.append(Text(""))
         return Group(*out)

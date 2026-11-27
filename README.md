@@ -1,10 +1,8 @@
 # rsi: a proto recursive self-improvement loop
 
-A language model works on itself. It writes its own tests for the goal you give it, decides how they run, measures
-itself, and changes itself however it can with code: weights, quantization, adapters, training, sampling
-parameters, system prompt. It registers each new version with ollama, tests it against itself, and if the new one
-is better it **switches into it**: the conversation carries over, and the new model continues the work. Then it
-picks its next goal and goes again.
+A language model can choose its training examples, write weight edits, and train candidate models. It registers
+and tests candidates with Ollama. An independent evaluator decides whether a candidate takes over the conversation
+and becomes the editor for the next cycle. The default workflow uses locally generated problems.
 
 ```
 rsi            # in any folder: pick a model, type the main prompt (the goal), then watch it work on itself
@@ -17,7 +15,15 @@ rsi settings   # ollama servers, thinking budget, limits, sandbox
 
 Each folder is its own loop: state in `<folder>/.rsi/`, the model's files in `<folder>/workspace/`. The loop runs in
 the background, so closing the window (ctrl+q) doesn't stop it; `rsi stop` does. Run `rsi` in the folder again to
-reconnect (or restart it). After a crash or reboot it resumes where it was, with its whole conversation.
+reconnect. On first start, RSI installs and enables a persistent systemd user service and enables lingering so
+it starts after reboot without a login. The service restarts the loop after crashes, independently of the UI.
+Startup retries temporary Ollama failures. Completed cycles and saved conversation survive restart; interrupted
+jobs are reported as lost so the pilot can resume from its own checkpoints. An interrupted final history record is
+preserved separately and repaired on the next append. `rsi stop` persists across reboots.
+
+Starting a loop requires a working systemd user manager and permission to enable lingering. Setup fails visibly
+if either is unavailable. No service is installed merely by inspecting this repository or running unit tests.
+Older loops launched by the previous version should be stopped and started once to adopt the service.
 
 ## Commands
 
@@ -44,16 +50,16 @@ There is no fixed script: the model has tools and a playbook, and decides. The p
    check tool use, judge length). For goals with no checkable answer (writing, advice, design), it must write a
    `rubric.md` grading scale before the first run; a judge model then scores every response strictly by it,
    criterion by criterion, blind to which model wrote it. The rubric and its judge are frozen on first use, so
-   scores stay comparable across versions. It keeps a build set to study and a held-out set to decide with. GSM8K and
-   ARC-Challenge come ready-made in `tests/library/` as a check against getting worse at everything else.
+   scores stay comparable across versions. `rsi_lib.practice_problems()` supplies fresh local development examples.
+   The pilot can also write its own generators and graders.
 2. **Pick how the tests run:** thinking on/off/low/medium/high, token budget, whether the tested model gets internet
    (web search) or code (a Python tool), tool rounds, system prompt, temperature.
 3. **Test itself and read its failures.**
 4. **Change itself**, with any code in its workspace: closed-form weight edits, merges, layer surgery, training or
-   LoRA (it can `pip install` what it needs), re-quantization, or just new Modelfile parameters and a system prompt.
-5. **Register and test** candidates against itself on the held-out suite, with the same settings.
-6. **Decide:** `switch_model` into a better one (the conversation moves into the new model; if the new model can't
-   carry on, the loop switches back automatically), or stay and delete the failures.
+   LoRA using installed packages or local wheels, re-quantization, or just new Modelfile parameters and a system prompt.
+5. **Register and test** candidates against itself on development suites with the same settings.
+6. **Submit:** `switch_model` sends one candidate per cycle to the independent evaluator. A passing candidate takes
+   over and has up to three replies to complete a tool call. The loop restores its parent if the handoff fails.
 7. **Finish:** a summary, 2–4 goals for the next cycle, and its pick. The next cycle starts on that goal, unless you
    typed one.
 
@@ -69,14 +75,15 @@ The sidebar shows the step it is on, its latest scores, its plans for the next c
 
 | tool | what it does |
 |---|---|
-| `run_python`, `run_shell` | any code in the workspace: numpy, torch, gguf, `rsi_lib`; `pip install`; internet; GPU |
+| `run_python`, `run_shell` | code in the workspace with NumPy, PyTorch, GGUF helpers and an available GPU |
 | `read_file`, `write_file`, `list_files` | files in the workspace |
 | `start_job`, `job_status`, `job_log`, `stop_job`, `wait` | long work (training, data generation) in the background, with no time limit; the model keeps working and is told when a job ends |
-| `web_search`, `arxiv_search`, `fetch_page` | research (TinyFish, arXiv); pages are treated as untrusted text |
+| `start_training` | train and save a candidate GGUF from a pilot-authored JSONL curriculum or fresh procedural examples, with optional MLP widening |
+| `web_search`, `arxiv_search`, `fetch_page` | Tinyfish-only search and page reading (including arXiv searches); pages are untrusted text |
 | `ollama_create` | register a model: a GGUF it built and/or Modelfile lines (PARAMETER, SYSTEM, TEMPLATE, ADAPTER) on top of a model |
 | `ollama_list`, `ollama_delete` | its models; it can only delete models it made, never its current self |
 | `run_tests` | run a suite on several models with the settings it picks; scores, fixed/broken vs the baseline, sign-test p, failing excerpts |
-| `switch_model` | become one of its models (only after testing it, by default) |
+| `switch_model` | submit one candidate per cycle to the independent evaluator |
 | `finish` | end the cycle with plans and a pick |
 
 `rsi_lib` (importable in its code) has `read_tensor`, `write_model` (fast in-place copy), `write_gguf` (any change:
@@ -86,29 +93,58 @@ new tensors, types, metadata, dropped layers), `requantize`, `chat` (talk to any
 to move: neuron gain gradients, the top directions of each output matrix's gradient from a one-pass sketch, how
 much the examples agree, where the gradient sits; nothing is applied) and `gradient_step` (one small gain or
 low-rank step as a new GGUF), and **growth**: `grow_mlp` (new MLP neurons) and `grow_layers` (new layers) add
-parameters that start out changing nothing (replies stay word-for-word identical in ollama), and
-`gradient_step(kind="exact")` trains only those, everything else frozen. The playbook's "Training yourself in
-observed steps" and "Growing yourself" say how the model should use them: one step at a time, measured from the
-last kept candidate, judged on dev, guard and free-format suites against the untouched model.
+parameters with zeroed output paths at initialization, and
+`gradient_step(kind="exact")` trains just the selected slices. The growth helpers preserve the existing values and
+use zero output weights for added capacity. On some quantized GGUFs, preserving those values in widened or partially
+trained matrices requires storing them at higher precision. `train_step()` combines prompt formatting, measurement,
+and an actual weight update. Keep the `.new.json` sidecar with a grown GGUF to train the same slices again.
+
+### Independent evaluation
+
+The evaluator freezes a rubric and the digest of a local judge before the pilot starts. By default the judge is
+the original model; `judge_model` can select a different installed local model before the rubric is created.
+It does not use the pilot's conversation, code, graders, or test cache.
+
+For each candidate, it generates a fresh private set of goal tasks (normally 24), asks parent and candidate the
+same questions at fixed settings, and grades anonymous responses in shuffled order against the frozen binary
+criteria. Every criterion must be present exactly once. Promotion requires both a higher mean goal score and a
+positive paired sign test. The threshold spends a bounded 0.05 budget across submissions for the same goal and
+parent (`0.05 / (n * (n + 1))`); retrying an interrupted evaluation does not spend another submission. The task
+count grows if needed to keep that threshold reachable.
+
+Separately, 96 fresh exact-answer guard problems cover arithmetic, inventory, ordering, lookup, Python expression
+tracing, and output formatting. **Every family** must have at least as many fixes as regressions. Saturated guard
+tests do not prevent promotion when the actual goal improves.
+
+Seeds, tasks, answers, completed scores, model digests, and the frozen contract stay in `.rsi/state/`, outside the
+pilot's writable workspace. Only aggregate results return to the pilot. A temporary outage or process restart
+resumes the same tasks and already saved outcomes; it does not draw a new test. Accepted results survive a crash
+before model handoff. Completed rejected submissions cannot be rerolled against the same parent.
+
+These checks measure the sampled tasks, not universal capability. Goal tasks and references are model-generated,
+and their grading is performed by a frozen model that can still make mistakes. The exact-answer guards provide a
+separate check, but text-only goal evaluation cannot establish performance of arbitrary real-world actions.
 
 ## The sandbox
 
-By default code runs under bubblewrap in a systemd scope:
+Code always runs offline under bubblewrap in a systemd scope:
 
 - The workspace is the only writable place. The system, the rsi code and ollama's model files are read-only (the
   model reads its own weights from there; ollama's model folder is found whether it runs as a service, as you, from a
   snap or with `OLLAMA_MODELS`). The rest of your home folder is hidden, so keys and other files aren't visible.
-- **Internet:** through a proxy run by the loop that only connects to public addresses. Code can download, pip
-  install and call APIs, but can't reach this machine's services or your home network. `fetch_page` (which runs in
-  the loop itself) obeys the same rule, also for redirects.
-- **Ollama:** code can run and inspect any model through a door that allows chat, generate, embed, show and list.
+- **Network policy:** model-written code has no general network access. Research tools use only Tinyfish's search
+  and fetch APIs. There is no alternate search provider, direct page-fetch fallback, general proxy, or API redirect.
+  If Tinyfish is unavailable, the model receives a recoverable error and can continue local work.
+- **Ollama:** inference/admin addresses must be loopback HTTP(S) endpoints. Cloud-backed models are rejected.
+  Code reaches local inference through a door that allows chat, generate, embed, show and list.
   Creating and deleting models only goes through the tools, which keep track of which models the loop made, so your
   other models are safe.
 - Memory, CPU and time per run are capped (configurable). Background jobs have no time limit; they run until they
   finish, are stopped, or the loop stops.
 
-`rsi settings` can switch internet off, give code the local network too, or turn isolation off entirely (code then
-runs as you, with access to everything).
+Isolation is mandatory and direct internet/local-network access stays off. Saved sessions with older permissive
+sandbox settings are restricted when loaded. Install runtime dependencies before starting, or provide local wheels;
+`pip` inside model code cannot download packages. Remote Ollama URLs are rejected rather than silently used.
 
 ## Settings
 
@@ -118,14 +154,16 @@ next step.
 | section | settings |
 |---|---|
 | Ollama | inference server, admin server (creates/deletes models), keep-alive |
-| Main model | thinking (on/off/low/medium/high), thinking budget (tokens per reply), context window, temperature, tool calls and minutes per cycle (0 = no limit), continue on its own or wait for you, test before switching, web research tools |
+| Main model | thinking (on/off/low/medium/high), thinking budget (tokens per reply), context window, temperature, tool calls and minutes per cycle (0 = no limit), continue on its own or wait for you, web research tools |
 | Sandbox | isolation, internet, local network, memory cap, CPU cap, time limit per run, background jobs at once, memory cap per job |
 | Tests (defaults) | thinking, token budget, tool rounds, parallel problems |
 | Models | how many models it may keep at once |
 
 `.env` next to `bin/` can set `RSI_OLLAMA_URL` and `RSI_OLLAMA_ADMIN_URL` (used when no setting overrides them).
-Web search uses TinyFish when a key is in `~/.config/rsi/keys.json` or `TINYFISH_API_KEY`, otherwise arXiv, OpenAlex
-and Wikipedia.
+Web search requires a Tinyfish key in `~/.config/rsi/keys.json` (`{"tinyfish": "..."}`) or `TINYFISH_API_KEY`.
+Research tools are enabled by default for new loops; existing sessions keep their `research` setting. Missing keys,
+quotas and outages never trigger another provider. Runtime keys inherited at service creation are saved in
+`.rsi/service.env` with mode 0600, outside the model's sandbox.
 
 ## What we found so far (Qwen3.5-0.8B, thinking mode)
 
@@ -188,15 +226,32 @@ ln -s "$PWD/bin/rsi" ~/.local/bin/rsi
 ollama pull qwen3.5:0.8b
 ```
 
-The sandbox needs `bwrap` (`apt install bubblewrap`).
+The sandbox needs `bwrap` (`apt install bubblewrap`) and systemd user services. `loginctl enable-linger "$USER"`
+must be permitted; RSI requests it noninteractively on first start. If your machine requires administrator approval
+for lingering, configure that once before starting a loop. Dependency installation/model downloads above are setup
+steps; the running framework only uses local inference and Tinyfish.
+
+## Verification
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite covers mixed-precision gradients, strict network routing, history recovery, context retention,
+service configuration, private goal evaluation and resumable promotions. CUDA coverage runs when a device is
+available; unit tests do not launch model training, install services, or call external APIs.
 
 ## Files
 
 ```
 rsi/loop.py         the loop: one conversation across cycles and models, switching and switching back
+rsi/promotion.py    resumable paired acceptance tests   rsi/procedural.py  local regression problems
+rsi/goal_eval.py    frozen goal rubric and private tasks
+rsi/service.py      persistent service setup            rsi/journal.py     crash-tolerant history
+rsi/conversation.py recent tool exchanges and summaries  rsi/network.py     local inference policy
 rsi/tools.py        the model's tools          rsi/tests.py     test suites, running them, comparing models
 rsi/settings.py     rsi settings               rsi/playbook.md  what the model reads (tools, method, findings)
-rsi/sandbox.py      where its code runs        rsi/netgate.py   the sandbox's internet proxy and ollama door
+rsi/sandbox.py      where its code runs        rsi/netgate.py   the sandbox's local inference door
 rsi/app.py          the screen                 rsi_lib/         helpers importable in its code
 rsi/jobs.py         background jobs
 rsi/arch_qwen35.py  layer-streaming forward pass for Qwen3.5/3.8 (~1 GB resident even for 27B)
@@ -206,6 +261,6 @@ rsi/grow.py         growing a model: wider MLPs, new layers, written so that not
 rsi/gguf_io.py      read/patch GGUF tensors, register with ollama    rsi/edits.py  closed-form edit operators
 rsi/directions.py   behaviour directions       rsi/detectors.py  failure patterns in a trace
 rsi/research.py     web / arXiv search         rsi/llm.py   talking to ollama (streams live)
-data/               GSM8K test (MIT), ARC-Challenge test (CC BY-SA 4.0), Qwen3.5 tokenizer (Apache-2.0),
-                    50 reference reasoning traces written by Claude
+data/               Qwen3.5 tokenizer (Apache-2.0), plus historical experiments' GSM8K (MIT),
+                    ARC-Challenge (CC BY-SA 4.0), and Claude reference traces
 ```

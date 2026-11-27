@@ -1,17 +1,6 @@
-"""Where the model's code runs.
-
-By default (isolate on): a bubblewrap sandbox in its own namespaces, inside a systemd scope with memory and CPU caps.
-  - the workspace is the only writable place and the only one that persists
-  - the system, the rsi code, the Python environment and ollama's model files are read-only (the model reads its own
-    weights from there); the home directory is hidden
-  - internet: through the netgate proxy (public addresses only); this machine's local services are not reachable,
-    except ollama for running and inspecting models (see netgate.py)
-  - `pip install` works: packages go to <workspace>/.pkgs, which is on PYTHONPATH
-With `local` on, the sandbox shares this machine's network (everything local is reachable too). With isolate off, the
-code runs as you, in the workspace folder, with no walls at all.
-"""
+"""Isolated, offline code execution. Web research goes through host-owned Tinyfish tools."""
 import os, shutil, subprocess, sys
-from . import netgate
+from . import netgate, network
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,10 +17,13 @@ def _gpu_devices():
                         "/dev/nvidia-uvm-tools", "/dev/nvidia-modeset", "/dev/dri", "/dev/kfd") if os.path.exists(d)]
 
 
-def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=False, isolate=True,
+def command(workspace, argv, mem="4G", cpu_quota=None, internet=False, local=False, isolate=True,
             ollama_url="http://127.0.0.1:11434", gate_dir=None, env=None, ro=()):
     """-> (cmd, env for subprocess or None, cwd): argv wrapped in the sandbox with the workspace as its home.
     ro: extra folders to show read-only (e.g. where the model's own GGUF lives)"""
+    if internet or local or not isolate:
+        raise ValueError("code must remain isolated and offline; use Tinyfish research tools")
+    ollama_url = network.local_url(ollama_url)
     ws = os.path.realpath(workspace); os.makedirs(os.path.join(ws, ".pkgs"), exist_ok=True)
     venv = os.path.realpath(os.path.dirname(os.path.dirname(sys.executable)))
     pyroot = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
@@ -40,40 +32,29 @@ def command(workspace, argv, mem="4G", cpu_quota=None, internet=True, local=Fals
                 "PIP_BREAK_SYSTEM_PACKAGES": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
                 "PATH": f"{venv}/bin:{ROOT}/rsi/sbin:{w}/.pkgs/bin:/usr/local/bin:/usr/bin:/bin",
                 "LANG": "C.UTF-8", "TERM": "dumb", **(env or {})}
-    if not isolate:
-        base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1].rstrip("/")
-        cmd = list(argv); run_env = dict(os.environ, **base_env)
-    else:
-        b = ["bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-user-try",
-             "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
-             "--symlink", "usr/sbin", "/sbin", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
-        for p in {venv, pyroot, ROOT}:
-            if os.path.exists(p) and not p.startswith("/usr/"):
-                b += ["--ro-bind", p, p]
-        for d in sorted(set(model_dirs()) | {os.path.realpath(x) for x in ro if x and os.path.isdir(x)}):
-            if not d.startswith("/usr/"):
-                b += ["--ro-bind", d, d]
-        for d in _gpu_devices():
-            b += ["--dev-bind", d, d]
-        b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", "/workspace", "--clearenv"]   # also at its real path
-        inner = list(argv)
-        if local:
-            base_env["OLLAMA_HOST"] = ollama_url.split("://")[-1].rstrip("/")
-        else:
-            b += ["--unshare-net"]
-            doors = netgate.ensure(gate_dir or os.path.join(ws, ".net"), ollama_url)
-            b += ["--ro-bind", os.path.dirname(doors["ollama"]), "/run/rsi"]
-            pairs = ["/run/rsi/ollama.sock:11434"]
-            base_env["OLLAMA_HOST"] = "127.0.0.1:11434"
-            if internet:
-                pairs.append("/run/rsi/proxy.sock:3128")
-                for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
-                    base_env[k] = "http://127.0.0.1:3128"
-                base_env["NO_PROXY"] = base_env["no_proxy"] = "127.0.0.1,localhost"
-            inner = [os.path.join(venv, "bin", "python"), "-m", "rsi.netgate", "bridge", *pairs, "--"] + inner
-        for k, v in base_env.items():
-            b += ["--setenv", k, v]
-        cmd = b + inner; run_env = None
+    b = ["bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-user-try",
+         "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+         "--symlink", "usr/sbin", "/sbin", "--ro-bind", "/etc", "/etc", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    runtime = (os.path.join(ROOT, "rsi"), os.path.join(ROOT, "rsi_lib"),
+               os.path.join(ROOT, "data", "qwen35_tokenizer.json"))
+    for p in sorted({venv, pyroot, *runtime}):
+        if os.path.exists(p) and not p.startswith("/usr/"):
+            b += ["--ro-bind", p, p]
+    for d in sorted(set(model_dirs()) | {os.path.realpath(x) for x in ro if x and os.path.isdir(x)}):
+        if not d.startswith("/usr/"):
+            b += ["--ro-bind", d, d]
+    for d in _gpu_devices():
+        b += ["--dev-bind", d, d]
+    b += ["--bind", ws, ws, "--bind", ws, "/workspace", "--chdir", "/workspace", "--clearenv"]   # also at its real path
+    inner = list(argv)
+    b += ["--unshare-net"]
+    doors = netgate.ensure(gate_dir or os.path.join(ws, ".net"), ollama_url)
+    b += ["--dir", "/run/rsi", "--ro-bind", doors["ollama"], "/run/rsi/ollama.sock"]
+    base_env["OLLAMA_HOST"] = "127.0.0.1:11434"
+    inner = [os.path.join(venv, "bin", "python"), "-m", "rsi.netgate", "bridge", "/run/rsi/ollama.sock:11434", "--"] + inner
+    for k, v in base_env.items():
+        b += ["--setenv", k, v]
+    cmd = b + inner; run_env = None
     if shutil.which("systemd-run"):
         props = (["-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0"] if mem else []) + (["-p", f"CPUQuota={cpu_quota}"] if cpu_quota else [])
         if props:

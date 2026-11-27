@@ -20,15 +20,16 @@ Run settings, picked by the model for each run (defaults come from rsi settings)
   think          true / false / "low" / "medium" / "high"
   num_predict    token budget per reply (thinking included)
   internet       the tested model gets web_search and fetch_page
-  code           the tested model gets run_python (its own sandbox, with internet only if `internet` is on)
+  code           the tested model gets run_python (its own offline sandbox; `internet` enables only Tinyfish research tools)
   max_tool_steps how many tool rounds the tested model may use per problem
   system         a system prompt for the tested model
   temperature, top_k, top_p, min_p, presence_penalty, repeat_penalty (unset = the model's own Modelfile values)
   seed, n (only the first n problems)
 """
-import hashlib, json, math, os, re, threading, time, urllib.request
+import hashlib, json, math, os, re, tempfile, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from . import llm, research, sandbox, probes
+from decimal import Decimal
+from . import llm, network, research, sandbox, workspace_files
 
 SAMPLING = ("temperature", "top_k", "top_p", "min_p", "presence_penalty", "repeat_penalty")   # override the Modelfile's
 RUN_KEYS = ("think", "num_predict", "internet", "code", "max_tool_steps", "system", "seed", "n") + SAMPLING
@@ -60,23 +61,32 @@ def load_suite(ws, suite):
                       __import__("glob").glob(os.path.join(ws, "tests", "**", "problems.jsonl"), recursive=True))
         raise ValueError(f"no test suite at {os.path.relpath(p, ws)}. Suites you have: {', '.join(have) or 'none yet'}. A suite is "
                          "a folder tests/<name>/ with problems.jsonl (one JSON object per line with id, prompt, answer)")
-    problems = []
-    for i, l in enumerate(open(pf)):
+    problems, ids = [], set()
+    for i, l in enumerate(workspace_files.read(ws, pf).splitlines()):
         if l.strip():
             try:
                 d = json.loads(l)
             except ValueError:
                 raise ValueError(f"line {i + 1} of {os.path.relpath(pf, ws)} is not valid JSON")
+            if not isinstance(d, dict):
+                raise ValueError(f"line {i + 1} must be a JSON object")
             d.setdefault("id", f"p{i}")
-            if "prompt" not in d:
+            if not isinstance(d["id"], (str, int)) or d["id"] in ids:
+                raise ValueError(f"invalid or duplicate problem id on line {i + 1}")
+            ids.add(d["id"])
+            if not isinstance(d.get("prompt"), str) or not d["prompt"].strip():
                 raise ValueError(f"problem {d['id']} has no prompt")
             problems.append(d)
-    grade = open(gf).read() if gf and os.path.exists(gf) else None
+    if not problems:
+        raise ValueError("a test suite must contain at least one problem")
+    grade = workspace_files.read(ws, gf) if gf and os.path.lexists(gf) else None
     rf = os.path.join(p, "rubric.md") if os.path.isdir(p) else None
-    if grade is None and rf and os.path.exists(rf):
-        grade = {"rubric": open(rf).read()}
+    if grade is None and rf and os.path.lexists(rf):
+        grade = {"rubric": workspace_files.read(ws, rf)}
     try:
-        defaults = json.load(open(sf)) if sf and os.path.exists(sf) else {}
+        defaults = json.loads(workspace_files.read(ws, sf)) if sf and os.path.lexists(sf) else {}
+        if not isinstance(defaults, dict):
+            raise ValueError("settings must be an object")
     except ValueError:
         raise ValueError(f"{os.path.relpath(sf, ws)} must be one JSON object, e.g. {{\"think\": false, \"num_predict\": 2000}}")
     if grade is None and not all(("answer" in d or "answers" in d) for d in problems):
@@ -84,57 +94,51 @@ def load_suite(ws, suite):
     return p, problems, grade, defaults
 
 
+def committed_answer(content):
+    lines = (content or "").strip().splitlines()
+    if not lines:
+        return None
+    match = re.fullmatch(r"answer:\s*(.+)", lines[-1].strip().strip("*"), re.I)
+    return match[1].strip() if match else None
+
+
+NUMBER = re.compile(r"[+-]?\$?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?", re.I)
+
+
+def normalize_answer(value):
+    answer = str(value).strip().strip("*$` ").rstrip(".").strip().casefold()
+    if NUMBER.fullmatch(answer):
+        return Decimal(answer.replace(",", "").replace("$", ""))
+    return " ".join(answer.split())
+
+
 def default_grade(problem, response):
-    pred = probes.extract(response.get("content", ""))
-    p = re.sub(r"[\s*$\\,]", " ", pred).strip().lower()
-    for a in problem.get("answers") or [problem.get("answer")]:
-        a = str(a).strip().lower().replace(",", "")
-        if re.fullmatch(r"-?\d+(\.\d+)?(e-?\d+)?", a):
-            nums = re.findall(r"-?\d+(?:\.\d+)?(?:e-?\d+)?", p)
-            if nums and any(abs(float(x) - float(a)) <= 1e-6 * max(1, abs(float(a))) for x in (nums[0], nums[-1])):
-                return 1.0
-        elif re.fullmatch(r"[a-e]", a):
-            m = re.findall(r"\b([a-e])\b", p)
-            if m and m[0] == a:
-                return 1.0
-        elif p == a or re.search(rf"(?<!\w){re.escape(a)}(?!\w)", p):
-            return 1.0
-    return 0.0
-
-
-def write_library(ws, n=200):
-    """ready-made suites the model may use: GSM8K and ARC-Challenge test problems (as a forgetting check, say)"""
-    lib = os.path.join(ws, "tests", "library")
-    pool = probes.general_pool()
-    for name, prefix in (("gsm8k", "general:gsm8k"), ("arc_challenge", "general:arc")):
-        d = os.path.join(lib, name)
-        if os.path.exists(os.path.join(d, "problems.jsonl")):
-            continue
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "problems.jsonl"), "w") as f:
-            for it in [x for x in pool if x["suite"] == prefix][:n]:
-                f.write(json.dumps({"id": it["id"], "prompt": it["prompt"], "answer": it["gold"]}) + "\n")
-    readme = os.path.join(lib, "README.md")
-    if not os.path.exists(readme):
-        open(readme, "w").write("Ready-made suites (200 problems each, answers included): gsm8k (grade-school math), "
-                                "arc_challenge (science multiple choice). Use them to check that a change doesn't make you "
-                                "worse at things outside the goal. Your own suites go in tests/<name>/.\n")
+    content = (response.get("content") or "").strip()
+    if not content:
+        return 0.0
+    pred = committed_answer(content) or content.splitlines()[-1]
+    return float(any(normalize_answer(pred) == normalize_answer(answer)
+                     for answer in problem.get("answers") or [problem.get("answer")]))
 
 
 # ------------------------------------------------------------------------------------------------ running
 def model_digests(cfg):
     try:
-        with urllib.request.urlopen(cfg["ollama_url"] + "/api/tags", timeout=20) as r:
+        with network.open_local(cfg["ollama_url"] + "/api/tags", timeout=20) as r:
             return {m["name"]: m["digest"] for m in json.loads(r.read())["models"]}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def digest_for(tags, model):
+    return tags.get(model) or tags.get(model + ":latest")
 
 
 def modelfile_params(cfg, model):
     """the sampling parameters baked into a model's Modelfile (they apply unless a run overrides them)"""
     try:
         req = urllib.request.Request(cfg["ollama_url"] + "/api/show", json.dumps({"model": model}).encode(), {"Content-Type": "application/json"})
-        txt = json.loads(urllib.request.urlopen(req, timeout=30).read()).get("parameters", "")
+        txt = json.loads(network.open_local(req, timeout=30).read()).get("parameters", "")
         return {l.split()[0]: l.split()[1] for l in txt.splitlines() if len(l.split()) >= 2}
     except Exception:  # noqa: BLE001
         return {}
@@ -166,11 +170,13 @@ def attempt(cfg, model, problem, opts, box, ws, gate_dir, slot):
                     args = json.loads(args)
                 except ValueError:
                     args = {}
+            if not isinstance(args, dict):
+                args = {}
             if name == "run_python" and opts.get("code"):
-                d = os.path.join(box, re.sub(r"\W", "_", str(problem["id"]))); os.makedirs(d, exist_ok=True)
-                path = os.path.join(d, f"cell{len(calls)}.py"); open(path, "w").write(str(args.get("code", "")))
-                rc, out = sandbox.run_in_workspace(d, ["python", path], timeout=120, mem="2G", internet=bool(opts.get("internet")),
-                                                   ollama_url=cfg["ollama_url"], gate_dir=gate_dir)
+                with tempfile.TemporaryDirectory(prefix="rsi-test-code-") as d:
+                    rc, out = sandbox.run_in_workspace(d, ["python", "-c", str(args.get("code", ""))], timeout=120,
+                                                       mem="2G", internet=False,
+                                                       ollama_url=cfg["ollama_url"], gate_dir=gate_dir)
                 out = f"[exit {rc}]\n{out.strip()[-4000:]}"
             elif name in own_names:   # the problem's own tools answer with canned results
                 res = (problem.get("tool_results") or {}).get(name, '{"status": "ok"}')
@@ -238,28 +244,33 @@ def grade_all(cfg, ws, suite_path, grade_src, problems, records, gate_dir, judge
         return out
     if not grade_src:
         return [default_grade(byid[r["id"]], r) for r in records]
-    d = os.path.join(ws, ".grading"); os.makedirs(d, exist_ok=True)
-    tag = hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
-    inp, out = os.path.join(d, f"in-{tag}.jsonl"), os.path.join(d, f"out-{tag}.json")
-    with open(inp, "w") as f:
-        for r in records:
-            f.write(json.dumps({"problem": byid[r["id"]], "response": r}) + "\n")
-    gpath = os.path.join(suite_path, "grade.py")
-    rc, log = sandbox.run_in_workspace(ws, ["python", "-m", "rsi.grade", gpath, inp, out], timeout=900, mem=cfg.get("sandbox_mem") or "4G",
-                                       internet=False, ollama_url=cfg["ollama_url"], gate_dir=gate_dir)
+    tag = os.urandom(8).hex()
+    d = os.path.join(ws, ".grading", tag)
+    gpath, inp, out = (os.path.join(d, name) for name in ("grade.py", "input.jsonl", "scores.json"))
+    workspace_files.write(ws, gpath, grade_src)
+    workspace_files.write(ws, inp, "".join(json.dumps({"problem": byid[r["id"]], "response": r}) + "\n" for r in records))
+    # Keep suite-local imports working while executing the captured grader source.
+    argv = ["python", "-m", "rsi.grade", gpath, inp, out, suite_path]
+    log = ""
     try:
-        scores = json.load(open(out))
-    except (OSError, ValueError):
-        raise RuntimeError(f"grade.py failed: {log.strip()[-1500:]}")
-    for f in (inp, out):
-        try:
-            os.unlink(f)
-        except OSError:
-            pass
+        rc, log = sandbox.run_in_workspace(ws, argv, timeout=900, mem=cfg.get("sandbox_mem") or "4G",
+                                           internet=False, ollama_url=cfg["ollama_url"], gate_dir=gate_dir)
+        scores = json.loads(workspace_files.read(ws, out)) if rc == 0 else None
+        if not isinstance(scores, list) or len(scores) != len(records) or any(
+                not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in scores):
+            raise ValueError("grader must produce one finite score in [0, 1] per record")
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"grade.py failed: {exc}. {log[-1500:]}") from exc
+    finally:
+        for path in (inp, out, gpath):
+            try:
+                workspace_files.unlink(ws, path)
+            except OSError:
+                pass
     return scores
 
 
-def rubric_lock(lock_path, ws, path, grade_src, judge):
+def rubric_lock(lock_path, ws, path, grade_src, judge, digests):
     """a rubric (and its judge) is fixed the first time it is used; returns the judge to use"""
     if not isinstance(grade_src, dict):
         return None
@@ -269,8 +280,15 @@ def rubric_lock(lock_path, ws, path, grade_src, judge):
         if locks[key]["sha1"] != h:
             raise ValueError(f"{key}/rubric.md changed after it was first used ({locks[key]['at']}). Rubrics are fixed so scores stay "
                              "comparable: put the new rubric in a new suite (copy the problems) instead.")
-        return locks[key]["judge"]
-    locks[key] = {"sha1": h, "judge": judge, "at": time.strftime("%Y-%m-%d %H:%M")}
+        fixed_judge = locks[key]["judge"]
+        digest = digest_for(digests, fixed_judge)
+        if not digest or locks[key].get("digest", digest) != digest:
+            raise ValueError(f"the rubric judge for {key} changed or is unavailable")
+        judge = fixed_judge
+    digest = digest_for(digests, judge)
+    if not digest:
+        raise ValueError(f"cannot verify the rubric judge {judge}")
+    locks[key] = {"sha1": h, "judge": judge, "digest": digest, "at": time.strftime("%Y-%m-%d %H:%M")}
     if lock_path:
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         json.dump(locks, open(lock_path, "w"), indent=1)
@@ -281,29 +299,37 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
     """run a suite on several models with the same settings; the first model is the baseline for comparisons.
     For a rubric suite, `judge` (or settings["judge"], or the judge_model setting) grades; it is fixed on first use."""
     path, problems, grade_src, defaults = load_suite(ws, suite)
-    judge = rubric_lock(lock_path, ws, path, grade_src, (settings or {}).get("judge") or cfg.get("judge_model") or judge or models[0])
+    digests = model_digests(cfg)
+    judge = rubric_lock(lock_path, ws, path, grade_src,
+                        (settings or {}).get("judge") or cfg.get("judge_model") or judge or models[0], digests)
     opts = {"think": cfg.get("test_think", True), "num_predict": cfg.get("test_num_predict") or cfg.get("num_predict", 4096),
             "internet": False, "code": False, "max_tool_steps": cfg.get("test_max_tool_steps", 6), "seed": 0}
     opts.update({k: v for k, v in defaults.items() if k in RUN_KEYS})
     opts.update({k: v for k, v in (settings or {}).items() if k in RUN_KEYS and v is not None})
-    if opts.get("n"):
-        problems = problems[:int(opts["n"])]
-    digests = model_digests(cfg)
+    if opts.get("n") is not None:
+        n = int(opts["n"])
+        if n < 1:
+            raise ValueError("n must be at least 1")
+        problems = problems[:n]
+    if not digests:
+        raise RuntimeError("cannot verify model digests on the inference server")
+    if not cfg.get("research", False):
+        opts["internet"] = False
     for m in models:
-        if digests and m not in digests and m + ":latest" not in digests:
+        if m not in digests and m + ":latest" not in digests:
             raise ValueError(f"no model named {m} on the ollama server")
     run_id = run_id or time.strftime("run-%m%d-%H%M%S-") + os.urandom(2).hex()
-    out_dir = os.path.join(ws, "test_runs", run_id); os.makedirs(out_dir, exist_ok=True)
-    cache_dir = os.path.join(ws, "test_runs", ".cache"); os.makedirs(cache_dir, exist_ok=True)
-    suite_key = hashlib.sha1((json.dumps(problems, sort_keys=True) + (grade_src if isinstance(grade_src, str) else json.dumps(grade_src or "")) +
-                              json.dumps({k: opts.get(k) for k in RUN_KEYS if k != "n"}, sort_keys=True)).encode()).hexdigest()
+    out_dir = os.path.join(ws, "test_runs", run_id)
+    cache_dir = os.path.join(ws, "test_runs", ".cache")
+    suite_key = hashlib.sha256(json.dumps([2, problems, grade_src, opts, cfg["ollama_url"], cfg.get("num_ctx"),
+                                          digest_for(digests, judge) if judge else None], sort_keys=True).encode()).hexdigest()
     results = {}
     for m in models:
-        key = hashlib.sha1((suite_key + m + digests.get(m, digests.get(m + ":latest", m))).encode()).hexdigest()[:20]
+        key = hashlib.sha256((suite_key + m + digest_for(digests, m)).encode()).hexdigest()[:24]
         cache = os.path.join(cache_dir, key + ".jsonl")
         done = {}
-        if os.path.exists(cache):
-            for l in open(cache):
+        if os.path.lexists(cache):
+            for l in workspace_files.read(ws, cache).splitlines():
                 r = json.loads(l); done[r["id"]] = r
         todo = [p for p in problems if p["id"] not in done]
         if status:
@@ -314,7 +340,7 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
         def one(p, m=m, box=box):
             slot = "subject-" + threading.current_thread().name.split("_")[-1]
             return attempt(cfg, m, p, opts, box, ws, gate_dir, slot)
-        with open(cache, "a") as f, ThreadPoolExecutor(max(1, int(cfg.get("test_workers") or cfg.get("workers") or 1))) as ex:
+        with workspace_files.open_file(ws, cache, "a") as f, ThreadPoolExecutor(max(1, int(cfg.get("test_workers") or cfg.get("workers") or 1))) as ex:
             for rec in ex.map(one, todo):
                 with lock:
                     f.write(json.dumps(rec) + "\n"); f.flush(); done[rec["id"]] = rec
@@ -323,19 +349,20 @@ def run(cfg, ws, suite, models, settings=None, run_id=None, gate_dir=None, statu
         for r, s in zip(recs, grade_all(cfg, ws, path, grade_src, problems, recs, gate_dir, judge)):
             r["score"] = float(s)
         if isinstance(grade_src, dict):   # keep the judge's verdicts so unchanged answers aren't judged again
-            with open(cache, "w") as f:
+            with workspace_files.open_file(ws, cache, "w") as f:
                 for r in done.values():
                     f.write(json.dumps(r) + "\n")
-        with open(os.path.join(out_dir, re.sub(r"[^\w.-]", "_", m) + ".jsonl"), "w") as f:
+        with workspace_files.open_file(ws, os.path.join(out_dir, re.sub(r"[^\w.-]", "_", m) + ".jsonl"), "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
         results[m] = recs
     summary = summarize(results, models)
     summary.update(model_sampling_defaults={m: modelfile_params(cfg, m) for m in models})
-    summary.update(run_id=run_id, suite=os.path.relpath(path, ws), n=len(problems), settings=opts, graded_by=(
+    summary.update(run_id=run_id, suite=os.path.relpath(path, ws), n=len(problems), settings=opts,
+                   model_digests={m: digest_for(digests, m) for m in models}, graded_by=(
                    f"rubric, judged by {judge}" if judge else ("grade.py" if grade_src else "answers")),
                    files=os.path.relpath(out_dir, ws), at=time.strftime("%Y-%m-%d %H:%M"))
-    json.dump(summary, open(os.path.join(out_dir, "summary.json"), "w"), indent=1)
+    workspace_files.write(ws, os.path.join(out_dir, "summary.json"), json.dumps(summary, indent=1))
     return summary, results
 
 

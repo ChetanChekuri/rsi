@@ -10,6 +10,8 @@ Works with any model ollama serves: each call asks ollama what the model can do 
 """
 import json, os, re, time, urllib.error, urllib.request
 
+from . import network
+
 LIVE = {"dir": None}
 _CAPS = {}
 
@@ -30,20 +32,28 @@ def _live(slot, data):
         pass
 
 
-def model_caps(cfg, model, ttl=60):
+def model_caps(cfg, model, ttl=60, require_local=False):
     """{"caps": set of capabilities or None if ollama didn't say, "ctx": trained context length or None}"""
-    key = (cfg["ollama_url"], model); now = time.time()
+    url = network.local_url(cfg["ollama_url"])
+    key = (url, model); now = time.time()
     if key in _CAPS and now - _CAPS[key][0] < ttl:
-        return _CAPS[key][1]
+        cached = _CAPS[key][1]
+        if not require_local or cached.get("verified_local"):
+            return cached
     info = {"caps": None, "ctx": None}
     try:
-        req = urllib.request.Request(cfg["ollama_url"] + "/api/show", json.dumps({"model": model}).encode(), {"Content-Type": "application/json"})
-        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        req = urllib.request.Request(url + "/api/show", json.dumps({"model": model}).encode(), {"Content-Type": "application/json"})
+        d = json.loads(network.open_local(req, timeout=30).read())
+        network.local_model(d)
+        info["verified_local"] = True
         info["caps"] = set(d.get("capabilities") or []) or None
         ctx = [v for k, v in (d.get("model_info") or {}).items() if k.endswith(".context_length")]
         info["ctx"] = int(ctx[0]) if ctx else None
-    except Exception:  # noqa: BLE001
-        pass
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if require_local:
+            raise ServerDown("cannot verify local model capabilities") from exc
     _CAPS[key] = (now, info)
     return info
 
@@ -144,11 +154,13 @@ def salvage_calls(content, names):
 def _stream(req, timeout, live, model):
     th, ct, calls, last, final = [], [], [], 0.0, {}
     info = dict(live, model=model, started=time.time())
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with network.open_local(req, timeout=timeout) as r:
         for line in r:
             if not line.strip():
                 continue
             ch = json.loads(line); m = ch.get("message") or {}
+            if ch.get("error"):
+                raise ServerDown(str(ch["error"]))
             th.append(m.get("thinking") or ""); ct.append(m.get("content") or "")
             calls += m.get("tool_calls") or []
             if ch.get("done"):
@@ -157,26 +169,29 @@ def _stream(req, timeout, live, model):
                 _live(live["slot"], dict(info, thinking="".join(th)[-60000:], content="".join(ct)[-20000:], updated=time.time(),
                                          done=bool(ch.get("done")), tool_calls=calls))
                 last = time.time()
+    if not final:
+        raise ServerDown("ollama ended the stream before its completion record")
     msg = {"role": "assistant", "content": "".join(ct), "thinking": "".join(th)}
     if calls:
         msg["tool_calls"] = calls
     return {"message": msg, "done_reason": final.get("done_reason"), "eval_count": final.get("eval_count", 0)}
 
 
-def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=None, seed=0, live=None, timeout=7200, options=None):
+def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=None, seed=0, live=None, timeout=7200, options=None, retries=6):
     """one chat call; with `live` ({"slot": ..., "title": ...}) it streams into the live dir. cfg needs ollama_url;
     num_ctx / num_predict / keep_alive are taken from it when present."""
-    info = model_caps(cfg, model); caps = info["caps"]
+    info = model_caps(cfg, model, require_local=True); caps = info["caps"]
     think = think_value(think)
     if caps is not None and "thinking" not in caps:
         think = None                                   # this model can't think: don't ask (ollama would refuse)
     text_tools = bool(tools) and (cfg.get("text_tools") or (caps is not None and "tools" not in caps))
-    num_ctx = int(cfg.get("num_ctx") or 8192)
+    num_ctx = int((options or {}).get("num_ctx") or cfg.get("num_ctx") or 8192)
     if info["ctx"]:
         num_ctx = min(num_ctx, info["ctx"])
     stream = bool(live and LIVE["dir"])
     body = {"model": model, "stream": stream, "messages": text_tool_messages(messages, tools) if text_tools else messages,
-            "options": {"seed": seed, "num_predict": num_predict or cfg.get("num_predict") or 4096, "num_ctx": num_ctx, **(options or {})}}
+            "options": {"seed": seed, **(options or {}), "num_ctx": num_ctx,
+                        "num_predict": min(int(num_predict or cfg.get("num_predict") or 4096), max(128, num_ctx // 2))}}
     if think is not None:
         body["think"] = think
     if cfg.get("keep_alive"):
@@ -186,10 +201,14 @@ def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=Non
     if fmt:
         body["format"] = fmt
     err = None
-    for attempt in range(6):
+    for attempt in range(retries):
         req = urllib.request.Request(cfg["ollama_url"] + "/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})
         try:
-            r = _stream(req, timeout, live, model) if stream else json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+            r = _stream(req, timeout, live, model) if stream else json.loads(network.open_local(req, timeout=timeout).read())
+            if r.get("error") or not r.get("message"):
+                raise ServerDown(r.get("error") or "ollama returned no message")
+            if not stream and r.get("done") is not True:
+                raise ServerDown("ollama returned an incomplete non-streaming reply")
             break
         except urllib.error.HTTPError as e:
             msg = e.read().decode(errors="ignore")[:300]
@@ -204,9 +223,11 @@ def chat(cfg, model, messages, think=True, tools=None, fmt=None, num_predict=Non
                     text_tools = True; del body["tools"]; body["messages"] = text_tool_messages(messages, tools)
                     continue
                 raise ValueError(f"ollama refused the request for {model}: {msg}")   # unknown model, bad option: retrying won't help
-            err = e; time.sleep(10 * (attempt + 1))
+            err = e
         except Exception as e:  # noqa: BLE001
-            err = e; time.sleep(10 * (attempt + 1))
+            err = e
+        if attempt + 1 < retries:
+            time.sleep(10 * (attempt + 1))
     else:
         raise ServerDown(f"ollama unreachable for {model}: {err}")
     if tools and not r["message"].get("tool_calls"):
@@ -222,6 +243,6 @@ def unload(cfg, model):
     try:
         req = urllib.request.Request(cfg["ollama_url"] + "/api/generate", json.dumps({"model": model, "keep_alive": 0}).encode(),
                                      {"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=120).read()
+        network.open_local(req, timeout=120).read()
     except Exception:  # noqa: BLE001
         pass

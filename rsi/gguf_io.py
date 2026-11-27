@@ -7,10 +7,30 @@
 - registering a GGUF with ollama, reusing the base model's Modelfile (projector, renderer, parser, parameters)
 """
 import os, re, shutil, subprocess, tempfile
+from contextlib import contextmanager
+from . import network
 import numpy as np, gguf
 from gguf import quants
 
 INPLACE = {"Q8_0", "F16", "BF16", "F32"}
+
+
+def require_distinct_output(base, out):
+    if os.path.realpath(base) == os.path.realpath(out) or (os.path.exists(out) and os.path.samefile(base, out)):
+        raise ValueError("output must be a different file from the base model")
+
+
+@contextmanager
+def atomic_output(base, out):
+    require_distinct_output(base, out)
+    fd, staging = tempfile.mkstemp(prefix=".rsi-model-", suffix=".gguf", dir=os.path.dirname(os.path.abspath(out)))
+    os.close(fd)
+    try:
+        yield staging
+        os.replace(staging, out)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
 
 
 def q8_0(W):
@@ -74,7 +94,9 @@ def writers(g, l):
 
 
 def _env(host=None):
-    return dict(os.environ, OLLAMA_HOST=host) if host else None
+    host = network.local_url(host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434"))
+    env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+    return dict(env, OLLAMA_HOST=host, NO_PROXY="*", no_proxy="*")
 
 
 def ollama_show(tag, host=None):
@@ -85,6 +107,7 @@ def ollama_show(tag, host=None):
 
 def bake(base_path, out_path, specs, edit_fn):
     """copy base GGUF and apply `specs` in order. edit_fn(g, name, W, specs) -> W' or None (untouched)."""
+    require_distinct_output(base_path, out_path)
     shutil.copyfile(base_path, out_path)
     g = GGUF(out_path, "r+"); n = 0
     for name in list(g.T):
@@ -157,7 +180,10 @@ def register(tag, gguf_path, base_tag, host=None, extra=""):
     a server allowed to write the model store."""
     blob, mf = ollama_show(base_tag, host)
     if gguf_path:
-        mf = mf.replace(f"FROM {blob}", f"FROM {os.path.abspath(gguf_path)}", 1)
+        source = os.path.abspath(gguf_path)
+        if any(c.isspace() for c in source):
+            source = '"' + source + '"'
+        mf = mf.replace(f"FROM {blob}", f"FROM {source}", 1)
     mf = merge_modelfile(mf, extra)
     with tempfile.NamedTemporaryFile("w", suffix=".Modelfile", delete=False) as f:
         f.write(mf); path = f.name
@@ -171,4 +197,4 @@ def register(tag, gguf_path, base_tag, host=None, extra=""):
 
 
 def unregister(tag, host=None):
-    subprocess.run(["ollama", "rm", tag], capture_output=True, env=_env(host))
+    subprocess.run(["ollama", "rm", tag], capture_output=True, env=_env(host), check=True)

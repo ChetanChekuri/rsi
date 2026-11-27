@@ -15,9 +15,9 @@
     m = measure_gradient(ex, path=g["path"], exact=g["new"]); gradient_step(m, "w1.gguf", kind="exact")   # train them
 
 Then call the ollama_create tool to register a GGUF as a model, and run_tests to compare it with yourself.
-Only the workspace persists. Inside the sandbox `pip install` puts packages in .pkgs/ (already on the path).
+Only the workspace persists. Inside the offline sandbox, pip can install local wheels into .pkgs/ (already on the path).
 """
-import glob, json, os, re, shutil, subprocess, urllib.request
+import glob, json, os, re, secrets, shutil
 import numpy as np
 
 WS = os.environ.get("RSI_WORKSPACE", os.getcwd())   # /workspace inside the sandbox
@@ -71,13 +71,16 @@ def metadata(path=None):
 def write_model(edits, out, base=None):
     """Copy `base` (default: your current weights) to `out` and overwrite tensors in place (same shape; the tensor
     must be stored as Q8_0, F16, BF16 or F32). edits: {name: float32 array}. Fast; returns the absolute path."""
-    from rsi.gguf_io import GGUF
+    from rsi.gguf_io import GGUF, atomic_output
     out = out if os.path.isabs(out) else os.path.join(WS, out)
-    shutil.copyfile(base or current_gguf(), out)
-    g = GGUF(out, "r+")
-    for name, W in edits.items():
-        g.write(name, np.asarray(W, dtype=np.float32))
-    g.r.data.flush(); del g
+    base = base or current_gguf()
+    with atomic_output(base, out) as staging:
+        shutil.copyfile(base, staging)
+        g = GGUF(staging, "r+")
+        for name, W in edits.items():
+            g.write(name, np.asarray(W, dtype=np.float32))
+        g.r.data.flush()
+        del g
     return out
 
 
@@ -119,11 +122,18 @@ def write_gguf(out, tensors=None, types=None, metadata=None, drop=(), base=None)
       drop      tensor names to leave out (e.g. to remove layers; then fix the metadata and renumber)
     Unchanged tensors are streamed from the base file; the ones you replace are held in memory until written.
     Returns the absolute path."""
-    import gguf
-    from gguf import GGMLQuantizationType as Q
+    from rsi.gguf_io import atomic_output
     out = out if os.path.isabs(out) else os.path.join(WS, out)
+    base = base or current_gguf()
+    with atomic_output(base, out) as staging:
+        _write_gguf(staging, tensors, types, metadata, drop, base)
+    return out
+
+
+def _write_gguf(out, tensors, types, metadata, drop, base):
+    import gguf
     tensors, types, metadata, drop = dict(tensors or {}), dict(types or {}), dict(metadata or {}), set(drop)
-    r = gguf.GGUFReader(base or current_gguf())
+    r = gguf.GGUFReader(base)
     w = gguf.GGUFWriter(out, arch=r.fields["general.architecture"].contents(), endianess=r.endianess)
     for f in r.fields.values():
         if f.name == "general.architecture" or f.name.startswith("GGUF."):
@@ -149,7 +159,7 @@ def write_gguf(out, tensors=None, types=None, metadata=None, drop=(), base=None)
                 v = tensors[n]
                 if callable(v):
                     from rsi.gguf_io import GGUF
-                    v = v(GGUF(base or current_gguf()).deq(n))
+                    v = v(GGUF(base).deq(n))
                 v = np.asarray(v, dtype=np.float32)
                 typ = types.get(n) or (old[n].tensor_type.name if n in old and old[n].tensor_type.name in ("F32", "F16", "BF16", "Q8_0") else
                                       ("F32" if v.ndim == 1 or n.endswith("norm.weight") else "Q8_0"))
@@ -163,7 +173,6 @@ def write_gguf(out, tensors=None, types=None, metadata=None, drop=(), base=None)
     for n in order:
         w.write_tensor_data(plan[n][0] if plan[n] is not None else old[n].data, tensor_endianess=r.endianess)
     w.close()
-    return out
 
 
 def requantize(src, dst, qtype="Q4_K_M"):
@@ -239,8 +248,49 @@ def measure_gradient(examples, path=None, S=None, exact=None, **kw):
     direction (agreement_between_halves: ~0 none, ~0.5-0.8 a shared skill, ~1 a blanket shift), and which matrices
     the gradient is in. See the playbook: "Training yourself in observed steps"."""
     from rsi.gradstep import measure
-    path = path or current_gguf(); m = measure(S or stream(path), examples, exact=exact, **kw); m["base"] = path
+    if S is not None and path is not None and not os.path.samefile(path, S.g.path):
+        raise ValueError("path must identify the same model as the supplied stream")
+    S = S if S is not None else stream(path)
+    m = measure(S, examples, exact=exact, **kw)
+    m["base"] = os.fspath(S.g.path)
     return m
+
+
+def practice_problems(seed=None, per_family=16):
+    """Fresh local development examples with known answers. Keep training and development seeds separate."""
+    from rsi.procedural import ANSWER_FORMAT, generate
+    if not 1 <= per_family <= 10000:
+        raise ValueError("per_family must be between 1 and 10000")
+    rows = generate(secrets.randbits(128) if seed is None else seed, per_family)
+    return [dict(row, prompt=row["prompt"] + ANSWER_FORMAT) for row in rows]
+
+
+def train_step(out, problems=None, *, base=None, kind=None, size=None, layers=None, device="auto"):
+    """Train once on supplied problem rows or fresh local practice. Rows may override the formatted answer with completion."""
+    S = stream(base, device=device)
+    exact = grown(S.g.path)
+    kind = kind or ("exact" if exact else "gains")
+    if kind == "exact" and not exact:
+        raise ValueError("exact training needs the grown model's parameter map")
+    seed = secrets.randbits(128) if problems is None else None
+    rows = practice_problems(seed, per_family=8) if problems is None else problems
+    examples = []
+    for row in rows:
+        answer = row["completion"] if "completion" in row else "Answer: " + str(row["answer"])
+        if not isinstance(answer, str) or not answer.strip() or not isinstance(row["prompt"], str) or not row["prompt"].strip():
+            raise ValueError("training rows need a nonempty prompt and answer")
+        examples.append((chat_text(row["prompt"], S=S), answer))
+    options = {"targets": ()} if kind == "exact" else {}
+    if layers is None:
+        if kind == "exact":
+            layers = sorted({int(name.split(".")[1]) for name in exact})
+        else:
+            layers = range(max(0, S.L - 4), S.L)
+    measurement = measure_gradient(examples, S=S, exact=exact if kind == "exact" else None, layers=layers, **options)
+    if kind == "exact" and measurement["summary"]["exact_missing"]:
+        raise ValueError("some new parameters were not used by the forward pass")
+    outcome = gradient_step(measurement, out, kind=kind, size=0.01 if size is None and kind == "exact" else size)
+    return dict(outcome, training=dict(measurement["summary"], generated_seed=seed))
 
 
 def gradient_step(m, out, kind="gains", size=None, top=None):
@@ -253,6 +303,8 @@ def gradient_step(m, out, kind="gains", size=None, top=None):
     Returns {"path", "kind", "size", "changed"}. Register it with ollama_create, test it with run_tests, and measure
     the next step from it (measure_gradient(path=...)) only if it passed."""
     from rsi.gguf_io import GGUF
+    if size is not None and (not np.isfinite(size) or size <= 0):
+        raise ValueError("size must be positive and finite")
     base = m["base"]; g = GGUF(base); edits, changed = {}, 0
     if kind == "gains":
         G = m["gain_grads"].mean(0); layers = m["gain_layers"]; n = G.shape[1]
@@ -301,11 +353,26 @@ def gradient_step(m, out, kind="gains", size=None, top=None):
             edits[name] = W; changed += 1
     else:
         raise ValueError("kind is 'gains', 'lowrank' or 'exact'")
-    del g
-    try:
-        path = write_model(edits, out, base=base)
-    except AssertionError:   # tensor types that can't be overwritten in place: re-encode
-        path = write_gguf(out, tensors=edits, base=base)
+    if not edits:
+        raise ValueError("the measurement produced no weight updates")
+    if any(not np.isfinite(W).all() for W in edits.values()):
+        raise ValueError("the weight update contains a non-finite value")
+    if kind == "exact":
+        types = {}
+        for name, (spec, _) in m["exact"].items():
+            if name not in edits or spec == "all":
+                continue
+            storage = g.T[name].tensor_type
+            if storage.name not in ("F32", "F16", "BF16"):
+                # Quantized blocks can share a scale between edited and frozen columns. Promotion to F32
+                # keeps the original dequantized values exactly for every frozen entry.
+                types[name] = "F32"
+        path = write_gguf(out, tensors=edits, types=types, base=base)
+    else:
+        try:
+            path = write_model(edits, out, base=base)
+        except AssertionError:   # tensor types that can't be overwritten in place: re-encode
+            path = write_gguf(out, tensors=edits, base=base)
     if os.path.exists(base + ".new.json"):   # a grown model: the map of its new parameters carries over
         shutil.copyfile(base + ".new.json", path + ".new.json")
     return {"path": path, "kind": kind, "size": size, "changed": changed}

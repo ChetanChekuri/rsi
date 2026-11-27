@@ -1,24 +1,12 @@
-"""Internet for the sandbox without exposing this machine.
-
-The sandbox has its own network namespace, so on its own it can reach nothing. Two doors are opened into it, each a
-unix socket that the loop serves from outside:
-
-  proxy   an HTTP(S) proxy (CONNECT and plain HTTP) to the public internet. It resolves names itself and refuses
-          loopback, private, link-local and other non-public addresses, so code can't reach this machine's local
-          services or the home network. Inside the sandbox HTTP_PROXY / HTTPS_PROXY point at it (pip, curl,
-          requests, urllib, httpx all use them).
-  ollama  the inference server, for running and inspecting models (chat, generate, embed, show, tags). Creating,
-          copying, pulling and deleting models are refused: those go through the ollama_* tools, which track which
-          models the loop made.
-
-Inside the sandbox, `python -m rsi.netgate bridge SOCK:PORT ... -- CMD` listens on 127.0.0.1:PORT for each door,
-forwards to the socket, and runs CMD.
-"""
-import hashlib, ipaddress, os, socket, subprocess, sys, threading, urllib.parse
+"""An inference-only socket into local Ollama; no general internet proxy."""
+import hashlib, http.client, json, os, socket, subprocess, sys, threading, urllib.parse
 
 OLLAMA_OK = {"/api/chat", "/api/generate", "/api/embed", "/api/embeddings", "/api/show", "/api/tags", "/api/ps", "/api/version",
              "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/"}
+from . import network
+
 _started = {}
+_targets = {}
 _lock = threading.Lock()
 
 
@@ -61,11 +49,6 @@ def _head(conn, limit=65536):
     return head.decode("latin-1").split("\r\n"), rest
 
 
-def _close_headers(lines, first):
-    keep = [l for l in lines[1:] if l.split(":", 1)[0].strip().lower() not in ("connection", "proxy-connection", "keep-alive")]
-    return ("\r\n".join([first] + keep + ["Connection: close"]) + "\r\n\r\n").encode("latin-1")
-
-
 def _deny(conn, code, msg):
     body = msg.encode()
     try:
@@ -74,72 +57,81 @@ def _deny(conn, code, msg):
         conn.close()
 
 
-def public_address(host, port):
-    """resolve and return a public address to connect to, or None (never loopback / private / link-local / ...)"""
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError:
-        return None
-    for fam, _, _, _, addr in infos:
-        ip = ipaddress.ip_address(addr[0])
-        if getattr(ip, "ipv4_mapped", None):
-            ip = ip.ipv4_mapped
-        if ip.is_global and not ip.is_multicast:
-            return fam, addr
-    return None
-
-
-def _proxy(conn):
-    lines, rest = _head(conn)
-    if not lines:
-        return conn.close()
-    try:
-        method, target, ver = lines[0].split(" ", 2)
-    except ValueError:
-        return _deny(conn, "400 Bad Request", "bad request")
-    if method == "CONNECT":
-        host, _, port = target.rpartition(":"); port = int(port or 443); first = None
-    else:
-        u = urllib.parse.urlsplit(target)
-        if u.scheme != "http" or not u.hostname:
-            return _deny(conn, "400 Bad Request", "use an absolute http:// URL (https goes through CONNECT)")
-        host, port = u.hostname, u.port or 80
-        first = f"{method} {urllib.parse.urlunsplit(('', '', u.path or '/', u.query, ''))} {ver}"
-    host = host.strip("[]")
-    dest = public_address(host, port)
-    if not dest:
-        return _deny(conn, "403 Forbidden", f"rsi sandbox: {host} is not a public internet address")
-    try:
-        up = socket.socket(dest[0], socket.SOCK_STREAM); up.settimeout(30); up.connect(dest[1]); up.settimeout(None)
-    except OSError as e:
-        return _deny(conn, "502 Bad Gateway", f"could not connect to {host}: {e}")
-    if first is None:
-        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        if rest:
-            up.sendall(rest)
-    else:
-        up.sendall(_close_headers(lines, first) + rest)
-    _splice(conn, up)
-
-
 def _ollama(conn, target):
+    target = network.local_url(target)
+    conn.settimeout(30)
     lines, rest = _head(conn)
     if not lines:
         return conn.close()
     try:
-        method, path, ver = lines[0].split(" ", 2)
+        method, path, _ = lines[0].split(" ", 2)
+        url = urllib.parse.urlsplit(path)
     except ValueError:
         return _deny(conn, "400 Bad Request", "bad request")
-    if urllib.parse.urlsplit(path).path.rstrip("/") not in {p.rstrip("/") for p in OLLAMA_OK} or method not in ("GET", "POST", "HEAD"):
+    if url.scheme or url.netloc or url.fragment or not path.startswith("/") or (
+            url.path.rstrip("/") not in {p.rstrip("/") for p in OLLAMA_OK} or method not in ("GET", "POST", "HEAD")):
         return _deny(conn, "403 Forbidden", f"rsi sandbox: {method} {path} is not available here. Use the ollama_create / "
                                             "ollama_delete tools to add or remove models.")
-    host, _, port = target.rpartition(":")
+    headers = {}
+    for line in lines[1:]:
+        key, colon, value = line.partition(":")
+        key = key.lower()
+        if not colon or key.strip() != key or key == "transfer-encoding" or (key == "content-length" and key in headers):
+            return _deny(conn, "400 Bad Request", "invalid request framing")
+        headers[key] = value.strip()
+    size = headers.get("content-length", "0")
+    if not size.isascii() or not size.isdecimal() or len(size) > 9 or int(size) > 64 * 1024**2:
+        return _deny(conn, "413 Content Too Large", "unsupported request size")
+    size = int(size)
+    if len(rest) > size:
+        return _deny(conn, "400 Bad Request", "unexpected data after the request body")
+    body = bytearray(rest)
+    while len(body) < size:
+        data = conn.recv(min(65536, size - len(body)))
+        if not data:
+            return _deny(conn, "400 Bad Request", "truncated request body")
+        body.extend(data)
+    # Reject cloud-backed models even though the API server itself is local.
+    if body:
+        try:
+            request_data = json.loads(body)
+            # Go's JSON decoder accepts case-insensitive field names. Apply the same rule here,
+            # rejecting duplicate spellings instead of letting a second model bypass validation.
+            fields = {}
+            if not isinstance(request_data, dict):
+                raise ValueError("expected a JSON object")
+            for key, value in request_data.items():
+                key = key.casefold()
+                if key in fields:
+                    raise ValueError("duplicate field")
+                fields[key] = value
+            model = fields.get("model") or fields.get("name")
+            if model:
+                from . import llm
+                llm.model_caps({"ollama_url": target}, model, require_local=True)
+        except Exception:
+            return _deny(conn, "403 Forbidden", "cannot verify a local model for this request")
+    # Rebuild a single allowlisted request. The response may stream, but the client connection carries only this request.
+    dest = urllib.parse.urlsplit(target)
+    client = http.client.HTTPSConnection if dest.scheme == "https" else http.client.HTTPConnection
+    up = client(dest.hostname, dest.port, timeout=600)
     try:
-        up = socket.create_connection((host, int(port)), timeout=30); up.settimeout(None)
-    except OSError as e:
+        forward = {key: headers[key] for key in ("content-type", "accept", "authorization") if key in headers}
+        up.request(method, path, body=bytes(body) if size else None, headers=forward)
+        response = up.getresponse()
+    except (OSError, http.client.HTTPException) as e:
+        up.close()
         return _deny(conn, "502 Bad Gateway", f"ollama unreachable: {e}")
-    up.sendall(_close_headers(lines, lines[0]) + rest)
-    _splice(conn, up)
+    try:
+        permitted = ("content-type", "content-length", "content-encoding")
+        response_lines = [f"HTTP/1.1 {response.status} {response.reason}"]
+        response_lines += [f"{key}: {value}" for key, value in response.getheaders() if key.lower() in permitted]
+        conn.sendall(("\r\n".join(response_lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1"))
+        while data := response.read1(65536):
+            conn.sendall(data)
+    finally:
+        up.close()
+        conn.close()
 
 
 def _serve(path, handler):
@@ -150,7 +142,7 @@ def _serve(path, handler):
     def loop():
         while True:
             c, _ = srv.accept()
-            threading.Thread(target=lambda: _safe(handler, c), daemon=True).start()
+            threading.Thread(target=_safe, args=(handler, c), daemon=True).start()
     threading.Thread(target=loop, daemon=True).start()
 
 
@@ -165,18 +157,17 @@ def _safe(handler, c):
 
 
 def ensure(sockdir, ollama_url):
-    """start the two doors for this process (once per directory); returns {name: socket path}"""
+    """start the inference door for this process (once per directory); returns {name: socket path}"""
     with _lock:
+        _targets[sockdir] = network.local_url(ollama_url)
         if sockdir not in _started:
             d = sockdir
             if len(d) > 80:   # unix socket paths are limited to ~108 bytes: use the runtime dir instead
                 base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/rsi-{os.getuid()}"
                 d = os.path.join(base, "rsi", hashlib.sha1(sockdir.encode()).hexdigest()[:12])
             os.makedirs(d, mode=0o700, exist_ok=True)
-            p = {"proxy": os.path.join(d, "proxy.sock"), "ollama": os.path.join(d, "ollama.sock")}
-            _serve(p["proxy"], _proxy)
-            target = ollama_url.split("://")[-1].rstrip("/")
-            _serve(p["ollama"], lambda c: _ollama(c, target))
+            p = {"ollama": os.path.join(d, "ollama.sock")}
+            _serve(p["ollama"], lambda c: _ollama(c, _targets[sockdir]))
             _started[sockdir] = p
         return _started[sockdir]
 

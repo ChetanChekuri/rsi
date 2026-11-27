@@ -2,5 +2,6 @@ numpy
 torch          # CPU is fine for small models; a CUDA build for Qwen3.8-27B
 gguf
 tokenizers
+jinja2
 textual
 rich
